@@ -11,6 +11,10 @@ param(
     # Desliga o Smart App Control SOMENTE dentro deste Sandbox descartável (a imagem vem com o SAC em
     # bloqueio e recusa DLLs sem assinatura). Nunca altera o host. Exige decisão explícita do titular.
     [switch]$DisableSmartAppControlInSandbox,
+    # Só o instalador (e o que ele instala): para validar binários ASSINADOS com o Smart App Control LIGADO.
+    [switch]$InstallerOnly,
+    # Só o pacote portátil (modo real em console e atalhos iniciar/encerrar).
+    [switch]$PortableOnly,
     [int]$TimeoutMinutes = 45,
     [string]$ReportsRoot = 'C:\Codes\relatorios\bytehalt\sandbox'
 )
@@ -40,8 +44,11 @@ if ($ExportResults) { $out = New-Item -ItemType Directory -Force -Path (Join-Pat
 
 $runConfig = [ordered]@{
     run_id = $stamp
-    ui = -not $SkipUi
-    service_mode = -not $SkipServiceMode
+    tests = -not ($InstallerOnly -or $PortableOnly)
+    ui = -not ($SkipUi -or $InstallerOnly -or $PortableOnly)
+    service_mode = -not ($SkipServiceMode -or $InstallerOnly -or $PortableOnly)
+    installer = -not ($SkipServiceMode -or $PortableOnly)
+    portable = -not ($SkipServiceMode -or $InstallerOnly)
     workstation_lock = [bool]$IncludeWorkstationLock
     disable_smart_app_control = [bool]$DisableSmartAppControlInSandbox
     shutdown_when_done = [bool]$ExportResults

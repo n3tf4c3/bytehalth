@@ -76,7 +76,7 @@ try {
     if ($envInfo.tpm_present -ne $true) { $result.limitations += 'Sem TPM no Sandbox (esperado). Não houve tentativa de contornar.' }
 
     # ---------------- Testes automatizados (cargo test, binários compilados no host) ----------------
-    foreach ($exe in Get-ChildItem "$pkg\tests" -Filter *.exe) {
+    foreach ($exe in $(if ($config.tests -ne $false) { Get-ChildItem "$pkg\tests" -Filter *.exe } else { @() })) {
         $name = $exe.BaseName
         $log = Join-Path $live.FullName "$name.log"
         Write-Log "Executando $name"
@@ -120,6 +120,8 @@ try {
     # ---------------- Interface (prova GPUI) e serviço do Windows ----------------
     if ($config.ui) { . "$pkg\scripts\GuiProof.ps1" } else { Skip-Step 'Interface' 'Prova visual da interface' 'Desativada nesta rodada.' }
     if ($config.service_mode) { . "$pkg\scripts\ServiceMode.ps1" } else { Skip-Step 'Serviço do Windows' 'Serviço LocalSystem' 'Desativado nesta rodada.' }
+    if ($config.installer -or ($null -eq $config.installer -and $config.service_mode)) { . "$pkg\scripts\InstallerMode.ps1" } else { Skip-Step 'Instalador' 'Instalação e desinstalação' 'Desativado nesta rodada.' }
+    if ($config.portable -or ($null -eq $config.portable -and $config.service_mode)) { . "$pkg\scripts\PortableMode.ps1" } else { Skip-Step 'Portátil (modo real)' 'Serviço em console real' 'Desativado nesta rodada.' }
 } catch {
     $result.fatal = "$($_.Exception.Message) @ $($_.InvocationInfo.PositionMessage)"
     Write-Log "ERRO FATAL: $($result.fatal)"

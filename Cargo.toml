@@ -6,6 +6,7 @@ members = [
     "crates/bytehalt-windows",
     "crates/bytehalt-service",
     "crates/bytehalt-app",
+    "crates/bytehalt-setup",
 ]
 # A interface (GPUI) é pesada para compilar; os demais crates formam o padrão do `cargo build`.
 default-members = [

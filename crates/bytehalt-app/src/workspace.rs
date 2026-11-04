@@ -105,6 +105,8 @@ pub struct Workspace {
     pub settings_file: SettingsFile,
     pub settings_message: Option<String>,
     pub autostart: bool,
+    /// Abertura automática gravada pelo instalador para todos os usuários (HKLM).
+    pub machine_autostart: bool,
     pub tray: Option<Tray>,
     pub panel: Option<Panel>,
     pub tray_checked: std::time::Instant,
@@ -149,6 +151,7 @@ impl Workspace {
             settings_file,
             settings_message: None,
             autostart: bytehalt_windows::user::autostart_enabled(AUTOSTART_VALUE),
+            machine_autostart: bytehalt_windows::user::machine_autostart_enabled(AUTOSTART_VALUE),
             tray: None,
             panel: None,
             tray_checked: std::time::Instant::now(),
@@ -1189,12 +1192,21 @@ impl Workspace {
             .child(
                 ui::card(&t)
                     .child(ui::section("Inicialização", &t))
-                    .child(ui::checkbox("autostart", "Abrir o ByteHalt na bandeja ao entrar no Windows", self.autostart, cx).on_click(cx.listener(
-                        |ws, _, _, cx| {
-                            ws.toggle_autostart();
-                            cx.notify();
-                        },
-                    )))
+                    .when(self.machine_autostart, |c| {
+                        c.child(ui::notice(
+                            "Abre na bandeja ao entrar no Windows para todos os usuários (definido pelo instalador). Para desativar: Gerenciador de Tarefas > Aplicativos de inicialização.",
+                            Tone::Neutral,
+                            &t,
+                        ))
+                    })
+                    .when(!self.machine_autostart, |c| {
+                        c.child(ui::checkbox("autostart", "Abrir o ByteHalt na bandeja ao entrar no Windows", self.autostart, cx).on_click(cx.listener(
+                            |ws, _, _, cx| {
+                                ws.toggle_autostart();
+                                cx.notify();
+                            },
+                        )))
+                    })
                     .child(ui::muted("O serviço de proteção roda independentemente da interface.", &t))
                     .when_some(self.settings_message.clone(), |c, m| c.child(ui::muted(m, &t))),
             )

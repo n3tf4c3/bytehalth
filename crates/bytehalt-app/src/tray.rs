@@ -15,6 +15,9 @@ const CALLBACK: u32 = WM_APP + 17;
 const PROOF: u32 = WM_APP + 18;
 /// Pedido de outra instância (menu Iniciar, atalho): mostrar o painel existente.
 const SHOW: u32 = WM_APP + 19;
+/// Pedido do instalador (atualizar ou desinstalar): encerrar a interface. O `bytehalt-setup` usa o mesmo
+/// valor e a mesma classe de janela (`CLASS`); mudar aqui exige mudar lá.
+const QUIT: u32 = WM_APP + 20;
 const CLASS: &str = "ByteHalt.Tray.v1";
 const GROUP_BASE: usize = 100;
 
@@ -174,6 +177,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
         };
         if message == SHOW {
             let _ = state.sender.send(TrayAction::Open);
+            return 0;
+        }
+        if message == QUIT {
+            let _ = state.sender.send(TrayAction::Exit);
             return 0;
         }
         if message == PROOF {

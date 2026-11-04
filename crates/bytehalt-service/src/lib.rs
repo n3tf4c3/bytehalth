@@ -94,8 +94,9 @@ impl Host {
         } else {
             (Arc::new(VaultLocker::new(WmiBitLocker, db.clone())), Arc::new(VhdPlatform::default()))
         };
-        if !options.development {
-            // Cópia fiel de dono/ACL e leitura de tudo durante a migração; anexar VHDX.
+        if !options.simulated {
+            // Cópia fiel de dono/ACL e leitura de tudo durante a migração; anexar VHDX. No console (modo
+            // real portátil, elevado) também; sem elevação os privilégios simplesmente não existem.
             if let Err(e) = acl::enable_privileges(&["SeBackupPrivilege", "SeRestorePrivilege", "SeManageVolumePrivilege"]) {
                 eprintln!("{e:#}");
             }
@@ -240,10 +241,12 @@ impl Host {
                 Reply::Ack
             }
             Command::AnalyzeVault { path } => {
+                self.vaults_allowed()?;
                 self.may_replace(caller, &path)?;
                 Reply::VaultPlan(Box::new(self.vaults.analyze(&path)))
             }
             Command::PrepareVault { name, path, passphrase, max_bytes } => {
+                self.vaults_allowed()?;
                 self.may_replace(caller, &path)?;
                 Reply::Vault(Box::new(self.vaults.prepare(&name, &path, passphrase, max_bytes).map_err(invalid)?))
             }
@@ -313,6 +316,15 @@ impl Host {
     /// No serviço do sistema (SYSTEM), o CHAMADOR precisa poder substituir a pasta: sem isso, qualquer
     /// usuário local transformaria em cofre (e trancaria) a pasta de outro. No console de
     /// desenvolvimento o serviço já roda como o próprio usuário.
+    /// Cofres reais exigem o serviço instalado: no modo real portátil (console) ninguém anexaria os discos
+    /// depois de reiniciar, e apagar a pasta portátil perderia o registro dos cofres.
+    fn vaults_allowed(&self) -> Result<(), (ErrorCode, String)> {
+        if self.options.development && !self.options.simulated {
+            return Err((ErrorCode::Validation, "Cofres exigem o ByteHalt instalado (serviço do Windows). Use o instalador.".into()));
+        }
+        Ok(())
+    }
+
     fn may_replace(&self, caller: &Caller, raw: &str) -> Result<(), (ErrorCode, String)> {
         if self.options.development {
             return Ok(());

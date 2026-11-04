@@ -1,7 +1,7 @@
 ﻿param(
     [Parameter(Mandatory)][string]$Drive,
     [Parameter(Mandatory)][string]$Passphrase,
-    [ValidateSet('Test-RealBitLocker.ps1', 'Test-RealVault.ps1', 'Test-RealActivity.ps1')][string]$Test = 'Test-RealBitLocker.ps1'
+    [ValidateSet('Test-RealBitLocker.ps1', 'Test-RealVault.ps1', 'Test-RealActivity.ps1', 'Test-Installer.ps1')][string]$Test = 'Test-RealBitLocker.ps1'
 )
 # Executado na VM pela sessão SSH (logon de REDE). 1) Prova que o pipe de produção nega a rede.
 # 2) Roda o roteiro ($Test) numa tarefa agendada local (S4U, elevada, sem senha guardada),

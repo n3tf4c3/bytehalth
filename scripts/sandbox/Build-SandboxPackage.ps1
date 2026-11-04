@@ -38,6 +38,13 @@ Invoke-Cargo @('build', '--release', '--locked', '-p', 'bytehalt-app', '--featur
 Copy-Item -LiteralPath (Join-Path $target 'release\bytehalt.exe') -Destination (Join-Path $package 'app')
 Copy-Item -LiteralPath (Join-Path $target 'release\bytehalt-service.exe') -Destination (Join-Path $package 'service')
 Copy-Item -LiteralPath (Join-Path $proofTarget 'release\bytehalt.exe') -Destination (Join-Path $package 'proof')
+# Instalador com o conteúdo embutido (Fase 5); o roteiro InstallerMode.ps1 instala e desinstala no Sandbox.
+$setup = & (Join-Path $PSScriptRoot '..\release\Build-Installer.ps1') -OutDir (Join-Path $artifacts 'sandbox-build\installer') | Select-Object -Last 1
+New-Item -ItemType Directory -Force -Path (Join-Path $package 'setup') | Out-Null
+Copy-Item -LiteralPath $setup -Destination (Join-Path $package 'setup\bytehalt-setup.exe')
+# Pacote portátil (os atalhos são testados pelo PortableMode.ps1 numa cópia gravável).
+$portable = & (Join-Path $PSScriptRoot '..\portable\Build-Portable.ps1') -OutDir (Join-Path $artifacts 'sandbox-build\portable') | Select-Object -Last 1
+Copy-Item -LiteralPath $portable -Destination (New-Item -ItemType Directory -Force -Path (Join-Path $package 'portable')) -Recurse
 
 # Binários de teste: compilados sem executar; a lista sai do JSON do cargo.
 $json = Join-Path $artifacts 'test-build.json'

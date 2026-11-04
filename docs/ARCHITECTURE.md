@@ -313,4 +313,41 @@ Windows; interface GPUI com as 7 áreas, bandeja, notificações e temas; testes
 visual; roteiro e `.wsb` do Sandbox.
 
 Fase 2 (cofres) implementada e validada na VM de teste (§3). Fase 3 (senha mestra, TOTP e códigos de
-recuperação) implementada (§5). Fase 4 (uso real do disco, bloqueio ao suspender, testes interativos na VM) implementada (§2, §4, §9). Fora (fases seguintes): instalador e assinatura (F5); ETW Kernel-File para filtrar processos (evolução da F4).
+recuperação) implementada (§5). Fase 4 (uso real do disco, bloqueio ao suspender, testes interativos na VM) implementada (§2, §4, §9). Fase 5 (instalador, assinatura, portátil) implementada (§12). Fora: ETW Kernel-File para filtrar processos (evolução da F4).
+
+## 12. Instalação (Fase 5)
+
+Decisões do titular (04/11/2026): **instalador próprio em Rust** (`bytehalt-setup`) e assinatura com o
+certificado de assinatura de código do titular na **Certum SimplySign** (nuvem; o SimplySign Desktop
+precisa estar conectado durante o build).
+
+- `scripts/release/Build-Installer.ps1` compila interface e serviço em release, embute-os no
+  `bytehalt-setup.exe` (`BYTEHALT_PAYLOAD_DIR`) e gera `artifacts\installer\ByteHalt-Setup-<versão>.exe`
+  com `.sha256`. Com `-SignThumbprint` (ou `BYTEHALT_SIGN_THUMBPRINT`) assina os três executáveis com
+  `signtool` (SHA-256 + carimbo de tempo Certum); sem certificado saem **sem assinatura**.
+- **Smart App Control, comprovado no Sandbox com o SAC em bloqueio** (`-InstallerOnly`, sem desligar o
+  SAC): instalador e serviço **assinados** rodam e os 5 casos passam; o mesmo pacote **sem assinatura**
+  é recusado ("Uma política de Controle de Aplicativo bloqueou este arquivo"). SmartScreen: desde 2024
+  nenhum certificado dá reputação imediata; os primeiros downloads ainda podem avisar, com o nome do
+  editor verificado.
+- Manifesto `requireAdministrator`. Instalar/atualizar: pede à interface aberta que encerre (mensagem
+  da bandeja), para o serviço, grava em `%ProgramFiles%\ByteHalt` (executável em uso é renomeado e
+  apagado no reinício), cria/atualiza o serviço `ByteHalt` (LocalSystem, início automático, reinício
+  em falha 5 s/5 s/30 s), `HKLM\…\Run\ByteHalt = bytehalt.exe --tray`, atalho no menu Iniciar e a
+  entrada em Aplicativos instalados. Dados em `%ProgramData%\ByteHalt` são mantidos.
+- Desinstalar: **recusado enquanto houver cofres** (sem o serviço, os discos dos cofres não são
+  anexados depois de reiniciar); remove serviço, inicialização, atalho, entrada e arquivos; os dados
+  ficam, salvo `/purge` (só exatamente `%ProgramData%\ByteHalt`). Unidades BitLocker não são
+  alteradas.
+- `/quiet` com códigos de saída: 0 ok, 1 erro, 2 recusado (cofres), 3 sem administrador, 4 cancelado,
+  5 instalador sem conteúdo. Registro em `%TEMP%\bytehalt-setup.log`.
+- Validado no Sandbox (instalar, atualizar mantendo configuração, desinstalar mantendo dados,
+  reinstalar, `/purge`) e na VM (atualizar a instalação manual, **recusa com cofre real**, desinstalar,
+  reinstalar).
+- **Portátil** (`scripts/portable/Build-Portable.ps1`, assinado com `-SignThumbprint`): *demonstração*
+  (serviço simulado como o usuário) e *modo real* (serviço em console **elevado**, unidades BitLocker
+  de verdade enquanto aberto; dados ao lado). No modo real portátil o serviço **recusa cofres** (sem
+  serviço instalado ninguém anexaria os discos depois de reiniciar) e não recebe bloqueio do Windows
+  nem suspensão (eventos só do SCM). Atalhos `ferramentas\iniciar.ps1`/`encerrar.ps1` testados no
+  Sandbox numa cópia gravável. Os builds do Sandbox saem em `artifacts\sandbox-build` para não
+  sobrescrever as versões assinadas.

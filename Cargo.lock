@@ -749,6 +749,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "bytehalt-setup"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "bytehalt-core",
+ "bytehalt-windows",
+ "embed-resource",
+ "uuid",
+ "windows 0.62.2",
+ "windows-service",
+ "windows-sys",
+]
+
+[[package]]
 name = "bytehalt-windows"
 version = "0.2.0"
 dependencies = [

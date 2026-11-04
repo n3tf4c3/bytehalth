@@ -103,6 +103,17 @@ pub fn autostart_enabled(value_name: &str) -> bool {
     }
 }
 
+/// Abertura automática para todos os usuários, gravada pelo instalador (HKLM). O usuário comum não a
+/// altera; desativa-se em Gerenciador de Tarefas > Aplicativos de inicialização ou desinstalando.
+pub fn machine_autostart_enabled(value_name: &str) -> bool {
+    let (key, name) = (wide(RUN_KEY), wide(value_name));
+    let mut size = 0u32;
+    // SAFETY: cadeias terminadas em nulo; só consulta o tamanho.
+    unsafe {
+        RegGetValueW(HKEY_LOCAL_MACHINE, key.as_ptr(), name.as_ptr(), RRF_RT_REG_SZ, std::ptr::null_mut(), std::ptr::null_mut(), &mut size) == ERROR_SUCCESS
+    }
+}
+
 pub fn set_autostart(value_name: &str, command: Option<&str>) -> anyhow::Result<()> {
     let key_path = wide(RUN_KEY);
     let mut key: HKEY = std::ptr::null_mut();
