@@ -41,7 +41,7 @@ fn run(options: bytehalt_service::Options, stop: &std::sync::atomic::AtomicBool)
     host.journal(EventType::ServiceStarted, if host.options.simulated { "Serviço iniciado (modo simulado)." } else { "Serviço iniciado." });
     let mut server = host.serve()?;
     let mut next = Instant::now() + tick;
-    while !stop.load(Ordering::SeqCst) {
+    while !stop.load(Ordering::SeqCst) && !host.stop_requested.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(200));
         if Instant::now() < next {
             continue;

@@ -5,6 +5,7 @@
 mod account;
 mod assets;
 mod client;
+mod portable;
 mod present;
 #[cfg(feature = "gui-test")]
 mod proof;
@@ -28,9 +29,24 @@ fn main() {
 
 fn run() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let development = args.iter().any(|a| a == "--dev");
+    let value = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
+    // Portátil: `--portable demo|real` sobe o serviço ao lado e abre a interface; `--portable-stop` encerra.
+    let portable_mode = value("--portable").as_deref().and_then(portable::parse);
+    let portable_stop = args.iter().any(|a| a == "--portable-stop");
+    let development = args.iter().any(|a| a == "--dev") || portable_mode.is_some() || portable_stop;
     let start_hidden = args.iter().any(|a| a == "--tray");
     let client = client::Client::new(development)?;
+    if portable_stop {
+        portable::stop(&client);
+        return Ok(());
+    }
+    if let Some(mode) = portable_mode {
+        if let Err(e) = portable::ensure_service(mode, &client) {
+            portable::message(&format!("{e:#}"), true);
+            return Ok(());
+        }
+        portable::ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
     #[cfg(feature = "gui-test")]
     let proof = args.iter().position(|a| a == "--gui-proof").and_then(|i| args.get(i + 1)).map(std::path::PathBuf::from);
     #[cfg(feature = "gui-test")]

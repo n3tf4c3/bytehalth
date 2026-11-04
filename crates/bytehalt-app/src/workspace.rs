@@ -606,7 +606,11 @@ impl Workspace {
                         self.lock(Command::LockGroup { id: g.id }, cx);
                     }
                 }
-                TrayAction::Exit => cx.quit(),
+                TrayAction::Exit => {
+                    // Aberta pelo portátil: "Sair" encerra também o serviço em console.
+                    crate::portable::on_exit(&self.client);
+                    cx.quit()
+                }
                 TrayAction::Unavailable => {
                     self.tray = None;
                     self.show();

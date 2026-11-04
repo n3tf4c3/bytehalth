@@ -103,6 +103,8 @@ pub enum Command {
     RemoveVault {
         id: Uuid,
     },
+    /// Só no serviço em console (portátil): encerra o serviço. O pipe do console aceita apenas o próprio usuário.
+    StopConsole,
     /// Fase 3: senha mestra, autenticador e códigos de recuperação. Senhas e códigos nunca são registrados.
     GetAuthStatus,
     BeginAuthSetup {
@@ -164,6 +166,7 @@ impl Command {
             Self::DiscardVault { .. } => "DiscardVault",
             Self::DeleteVaultReserve { .. } => "DeleteVaultReserve",
             Self::RemoveVault { .. } => "RemoveVault",
+            Self::StopConsole => "StopConsole",
             Self::GetAuthStatus => "GetAuthStatus",
             Self::BeginAuthSetup { .. } => "BeginAuthSetup",
             Self::FinishAuthSetup { .. } => "FinishAuthSetup",

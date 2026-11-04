@@ -59,6 +59,8 @@ pub struct Host {
     pub bitlocker: Option<Arc<BitLockerLocker<WmiBitLocker>>>,
     pub vaults: Arc<VaultManager>,
     pub auth: Arc<MasterAuth>,
+    /// Pedido de encerramento do serviço em console (`StopConsole`, modo portátil).
+    pub stop_requested: std::sync::atomic::AtomicBool,
     pub clock: Arc<dyn Clock>,
 }
 
@@ -122,7 +124,7 @@ impl Host {
                 let _ = engine.delete_resource(rid);
             }
         }
-        Ok(Self { options, engine, config: db, simulated, bitlocker, vaults, auth, clock })
+        Ok(Self { options, engine, config: db, simulated, bitlocker, vaults, auth, clock, stop_requested: std::sync::atomic::AtomicBool::new(false) })
     }
 
     pub fn journal(&self, event: EventType, message: &str) {
@@ -215,6 +217,13 @@ impl Host {
             }
             Command::DiscoverVolumes => self.discover(),
             Command::GetVaults => Reply::Vaults(self.vaults.list()),
+            Command::StopConsole => {
+                if !self.options.development {
+                    return Err((ErrorCode::Forbidden, "Só o serviço em console (portátil) pode ser encerrado pelo pipe.".into()));
+                }
+                self.stop_requested.store(true, std::sync::atomic::Ordering::SeqCst);
+                Reply::Ack
+            }
             Command::GetAuthStatus => Reply::AuthStatus(self.auth.status(&caller.sid)),
             Command::BeginAuthSetup { password } => Reply::Enrollment(self.auth.begin_setup(&caller.sid, &password).map_err(auth_err)?),
             Command::FinishAuthSetup { code } => Reply::RecoveryCodes(self.auth.finish_setup(&caller.sid, &code).map_err(auth_err)?),

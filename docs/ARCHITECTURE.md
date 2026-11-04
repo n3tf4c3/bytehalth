@@ -348,6 +348,10 @@ precisa estar conectado durante o build).
   (serviço simulado como o usuário) e *modo real* (serviço em console **elevado**, unidades BitLocker
   de verdade enquanto aberto; dados ao lado). No modo real portátil o serviço **recusa cofres** (sem
   serviço instalado ninguém anexaria os discos depois de reiniciar) e não recebe bloqueio do Windows
-  nem suspensão (eventos só do SCM). Atalhos `ferramentas\iniciar.ps1`/`encerrar.ps1` testados no
-  Sandbox numa cópia gravável. Os builds do Sandbox saem em `artifacts\sandbox-build` para não
+  nem suspensão (eventos só do SCM). Os atalhos `.cmd` só chamam o executável assinado:
+  `bytehalt.exe --portable demo|real` (sobe o serviço oculto; no modo real pelo UAC) e
+  `--portable-stop` (pedido de saída pela bandeja + `StopConsole` no pipe, comando aceito só no console).
+  "Sair" na bandeja também encerra o serviço portátil. Sem PowerShell: antivírus vigiam
+  `-ExecutionPolicy Bypass` e políticas de aplicativo põem scripts sem assinatura em modo restrito.
+  Testado no Sandbox pelos próprios `.cmd`, numa cópia gravável. Os builds do Sandbox saem em `artifacts\sandbox-build` para não
   sobrescrever as versões assinadas.

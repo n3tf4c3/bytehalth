@@ -34,7 +34,7 @@ foreach ($p in $dir, $zip) {
         Remove-Item -LiteralPath $full -Recurse -Force
     }
 }
-New-Item -ItemType Directory -Force -Path (Join-Path $dir 'licencas'), (Join-Path $dir 'ferramentas') | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $dir 'licencas') | Out-Null
 Copy-Item -LiteralPath (Join-Path $repo 'artifacts\rust-target\release\bytehalt.exe'), (Join-Path $repo 'artifacts\rust-target\release\bytehalt-service.exe') -Destination $dir
 Copy-Item -LiteralPath (Join-Path $repo 'assets\GPUI-APACHE.txt') -Destination (Join-Path $dir 'licencas\GPUI-Apache-2.0.txt')
 Copy-Item -LiteralPath (Join-Path $repo 'assets\icons\LICENSE') -Destination (Join-Path $dir 'licencas\Material-Symbols-Apache-2.0.txt')
@@ -53,92 +53,11 @@ $utf8 = New-Object Text.UTF8Encoding $true
 $ascii = New-Object Text.ASCIIEncoding
 function Write-Text([string]$path, [string]$text, $enc) { [IO.File]::WriteAllText($path, $text.Replace("`r`n", "`n").Replace("`n", "`r`n"), $enc) }
 
-# Ferramentas (PowerShell com -ExecutionPolicy Bypass só no processo; nada é alterado no sistema).
-Write-Text (Join-Path $dir 'ferramentas\iniciar.ps1') @'
-param([ValidateSet('demo', 'real')][string]$Modo = 'demo')
-# Inicia o serviço (simulado como o usuário, ou real elevado) e a interface. Nada é instalado.
-$base = Split-Path $PSScriptRoot -Parent
-$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-$pipe = "ByteHalt.Dev.v1.$sid"
-function PipeUp { @(Get-ChildItem '\\.\pipe\' | Where-Object Name -eq $pipe).Count -gt 0 }
-if (-not (PipeUp)) {
-    $svc = Join-Path $base 'bytehalt-service.exe'
-    if ($Modo -eq 'demo') {
-        Start-Process -FilePath $svc -ArgumentList @('--simulate', '--data-dir', "`"$(Join-Path $base 'dados')`"") -WindowStyle Minimized
-    } else {
-        # BitLocker exige administrador: o Windows pede a confirmação (UAC).
-        try {
-            Start-Process -FilePath $svc -ArgumentList @('--data-dir', "`"$(Join-Path $base 'dados-real')`"") -Verb RunAs -WindowStyle Minimized
-        } catch {
-            [void](New-Object -ComObject WScript.Shell).Popup('O modo real precisa de permissão de administrador (BitLocker).', 0, 'ByteHalt', 48)
-            exit 1
-        }
-    }
-    $deadline = (Get-Date).AddSeconds(20)
-    while (-not (PipeUp) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
-    if (-not (PipeUp)) {
-        [void](New-Object -ComObject WScript.Shell).Popup('O serviço do ByteHalt não iniciou.', 0, 'ByteHalt', 16)
-        exit 1
-    }
-}
-Start-Process -FilePath (Join-Path $base 'bytehalt.exe') -ArgumentList '--dev'
-'@ $utf8
-
-Write-Text (Join-Path $dir 'ferramentas\encerrar.ps1') @'
-# Encerra a interface (pela bandeja) e o serviço DESTA pasta portátil (demonstração ou real).
-# O serviço do modo real roda elevado: se houver um que não dá para identificar, roda de novo como administrador.
-Add-Type -Namespace ByteHalt -Name Win -MemberDefinition @"
-[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern System.IntPtr FindWindowW(string c, string n);
-[DllImport("user32.dll")] public static extern bool PostMessageW(System.IntPtr h, uint m, System.IntPtr w, System.IntPtr l);
-"@
-$log = Join-Path $env:TEMP 'bytehalt-encerrar.log'
-function Log($m) { Add-Content -LiteralPath $log -Value ('{0:HH:mm:ss} {1}' -f (Get-Date), $m) }
-$base = Split-Path $PSScriptRoot -Parent
-# Só processos desta pasta (nunca uma instalação do ByteHalt aberta ao mesmo tempo).
-function Mine([string]$name) { @(Get-Process $name -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($base, [StringComparison]::OrdinalIgnoreCase) }) }
-$admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-
-if (Mine 'bytehalt') {
-    # A interface pode estar abrindo: espera a janela da bandeja aparecer (até 8 s).
-    $h = [IntPtr]::Zero
-    $until = (Get-Date).AddSeconds(8)
-    while ($h -eq [IntPtr]::Zero -and (Mine 'bytehalt') -and (Get-Date) -lt $until) {
-        # [NullString]: o PowerShell converteria $null em texto vazio (procuraria um título vazio).
-        $h = [ByteHalt.Win]::FindWindowW('ByteHalt.Tray.v1', [NullString]::Value)
-        if ($h -eq [IntPtr]::Zero) { Start-Sleep -Milliseconds 300 }
-    }
-    Log "janela da bandeja: $h"
-    if ($h -ne [IntPtr]::Zero) {
-        Log ("pedido de saída enviado: " + [ByteHalt.Win]::PostMessageW($h, 0x8000 + 20, [IntPtr]::Zero, [IntPtr]::Zero))
-        $deadline = (Get-Date).AddSeconds(10)
-        while ((Mine 'bytehalt') -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
-    }
-    foreach ($p in Mine 'bytehalt') { Log "interface ainda aberta (PID $($p.Id)): encerrando à força"; Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
-}
-foreach ($p in Mine 'bytehalt-service') { Log "serviço PID $($p.Id): encerrando"; Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
-$hidden = @(Get-Process bytehalt-service -ErrorAction SilentlyContinue | Where-Object { -not $_.Path })
-if ($hidden.Count -and -not $admin) {
-    Log 'serviço elevado (modo real): pedindo administrador para encerrá-lo'
-    try { Start-Process powershell.exe -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', "`"$PSCommandPath`"" -Verb RunAs -Wait } catch { Log 'administrador negado' }
-}
-Log 'fim'
-'@ $utf8
-
-Write-Text (Join-Path $dir 'Iniciar-demonstracao.cmd') @'
-@echo off
-rem ByteHalt - demonstracao (modo simulado). Nenhuma unidade real e tocada.
-powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%~dp0ferramentas\iniciar.ps1" -Modo demo
-'@ $ascii
-Write-Text (Join-Path $dir 'Iniciar-modo-real.cmd') @'
-@echo off
-rem ByteHalt - modo real portatil: protege unidades BitLocker de verdade enquanto o servico estiver aberto.
-powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%~dp0ferramentas\iniciar.ps1" -Modo real
-'@ $ascii
-Write-Text (Join-Path $dir 'Encerrar.cmd') @'
-@echo off
-rem Encerra a interface e o servico portatil (demonstracao ou real).
-powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%~dp0ferramentas\encerrar.ps1"
-'@ $ascii
+# Atalhos: só o executável assinado (sem PowerShell: antivírus vigiam "-ExecutionPolicy Bypass" e políticas de
+# aplicativo põem scripts sem assinatura em modo restrito).
+Write-Text (Join-Path $dir 'Iniciar-demonstracao.cmd') "@echo off`nrem ByteHalt - demonstracao (modo simulado). Nenhuma unidade real e tocada.`nstart """" ""%~dp0bytehalt.exe"" --portable demo`n" $ascii
+Write-Text (Join-Path $dir 'Iniciar-modo-real.cmd') "@echo off`nrem ByteHalt - modo real portatil: protege unidades BitLocker de verdade enquanto aberto (pede administrador).`nstart """" ""%~dp0bytehalt.exe"" --portable real`n" $ascii
+Write-Text (Join-Path $dir 'Encerrar.cmd') "@echo off`nrem Encerra a interface e o servico portatil (demonstracao ou real).`nstart """" /wait ""%~dp0bytehalt.exe"" --portable-stop`n" $ascii
 
 $sha = @{}
 foreach ($f in 'bytehalt.exe', 'bytehalt-service.exe') { $sha[$f] = (Get-FileHash -LiteralPath (Join-Path $dir $f) -Algorithm SHA256).Hash }
@@ -154,10 +73,10 @@ DOIS MODOS (use um de cada vez)
                 Unidades e cofres SIMULADOS: nenhum disco ou BitLocker real é tocado.
                 Sem administrador. Dados em .\dados. Senha das unidades simuladas: bytehalt-teste
   Modo real     "Iniciar-modo-real.cmd"
-                Protege unidades BitLocker DE VERDADE enquanto o serviço estiver aberto (janela de
-                console minimizada). Pede administrador (UAC), porque o BitLocker exige. Dados em
+                Protege unidades BitLocker DE VERDADE enquanto o serviço estiver aberto (roda oculto,
+                sem janela). Pede administrador (UAC), porque o BitLocker exige. Dados em
                 .\dados-real. Use a senha real de cada unidade para desbloquear.
-  Para encerrar: "Sair" no menu da bandeja e "Encerrar.cmd" (encerra também o serviço).
+  Para encerrar: "Sair" no menu da bandeja ou "Encerrar.cmd" - os dois encerram também o serviço.
 
 A interface fica na BANDEJA do Windows. Fechar a janela leva para a bandeja; o ícone abre o painel.
 

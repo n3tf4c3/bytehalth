@@ -33,21 +33,19 @@ if (-not $portableSrc) {
     Copy-Item $portableSrc.FullName $copy -Recurse -Force
     function Wait-Gone { Wait-Until { -not (Get-Process bytehalt, bytehalt-service -ErrorAction SilentlyContinue) -and -not (Test-PipeExists $devPipe) } 30 'interface e serviço encerrados' }
     foreach ($mode in 'demo', 'real') {
-        Invoke-Step $P "Iniciar e Encerrar ($mode) pelos atalhos do pacote" {
-            $elog = Join-Path $env:TEMP 'bytehalt-encerrar.log'
-            Remove-Item $elog -ErrorAction SilentlyContinue
-            # Sem -Wait: no PowerShell 5.1 ele espera também os filhos (serviço e interface continuam rodando).
-            Start-Process powershell.exe -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$copy\ferramentas\iniciar.ps1`"", '-Modo', $mode
+        Invoke-Step $P "Iniciar e Encerrar ($mode) pelos atalhos .cmd do pacote" {
+            $launcher = if ($mode -eq 'demo') { 'Iniciar-demonstracao.cmd' } else { 'Iniciar-modo-real.cmd' }
+            Start-Process cmd.exe -ArgumentList '/c', "`"$copy\$launcher`""
             Wait-Until { (Test-PipeExists $devPipe) -and (Get-Process bytehalt -ErrorAction SilentlyContinue) } 40 "serviço e interface ($mode)"
             $pong = Invoke-ByteHaltPipe $devPipe 'Ping' $null @($sid)
             Assert-That ($pong.simulated -eq ($mode -eq 'demo')) "Modo: simulated=$($pong.simulated)"
             $dataDir = if ($mode -eq 'demo') { 'dados' } else { 'dados-real' }
             Assert-That (Test-Path "$copy\$dataDir\bytehalt.db") "Banco não criado em $dataDir."
-            Start-Process powershell.exe -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$copy\ferramentas\encerrar.ps1`"" -Wait
-            $text = (Get-Content $elog -ErrorAction SilentlyContinue) -join ' | '
-            try { Wait-Gone } catch { throw "$($_.Exception.Message) — restam: $((Get-Process bytehalt, bytehalt-service -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Name)($($_.Id))" }) -join ', ') — registro: $text" }
-            Assert-That ($text -notmatch 'à força') "A interface não atendeu ao pedido de saída: $text"
-            "simulated=$($pong.simulated); dados em $dataDir; encerrado — $text"
+            Start-Sleep 2
+            # Encerrar: pedido de saída pela bandeja + StopConsole pelo pipe; nada é encerrado à força.
+            Start-Process cmd.exe -ArgumentList '/c', "`"$copy\Encerrar.cmd`"" -Wait
+            try { Wait-Gone } catch { throw "$($_.Exception.Message) — restam: $((Get-Process bytehalt, bytehalt-service -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Name)($($_.Id))" }) -join ', ')" }
+            "simulated=$($pong.simulated); dados em $dataDir; interface e serviço encerrados sem forçar"
         }
     }
 }
