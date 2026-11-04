@@ -56,6 +56,11 @@ impl SqliteStore {
              CREATE TABLE IF NOT EXISTS vaults (id TEXT PRIMARY KEY, data TEXT NOT NULL);
              INSERT INTO schema_version (version) SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM schema_version);",
         )?;
+        // Migração (Fase 4): coluna nova em bancos criados antes dela.
+        let has_suspend = conn.prepare("SELECT 1 FROM pragma_table_info('groups') WHERE name = 'lock_on_suspend'")?.exists([])?;
+        if !has_suspend {
+            conn.execute_batch("ALTER TABLE groups ADD COLUMN lock_on_suspend INTEGER NOT NULL DEFAULT 0;")?;
+        }
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -127,8 +132,9 @@ impl ConfigRepository for SqliteStore {
             let (g, r) = row?;
             members.entry(g).or_default().push(r);
         }
-        let mut st =
-            c.prepare("SELECT id, name, inactivity_secs, mode, totp_threshold_secs, lock_on_workstation_lock FROM groups ORDER BY name COLLATE NOCASE")?;
+        let mut st = c.prepare(
+            "SELECT id, name, inactivity_secs, mode, totp_threshold_secs, lock_on_workstation_lock, lock_on_suspend FROM groups ORDER BY name COLLATE NOCASE",
+        )?;
         let rows = st.query_map([], |r| {
             let id = parse_id(r.get(0)?)?;
             Ok(ProtectionGroup {
@@ -143,6 +149,7 @@ impl ConfigRepository for SqliteStore {
                 },
                 totp_threshold_secs: r.get::<_, i64>(4)? as u64,
                 lock_on_workstation_lock: r.get::<_, i64>(5)? != 0,
+                lock_on_suspend: r.get::<_, i64>(6)? != 0,
             })
         })?;
         let mut groups: Vec<ProtectionGroup> = rows.collect::<Result<_, _>>()?;
@@ -156,16 +163,19 @@ impl ConfigRepository for SqliteStore {
         let mut c = self.conn();
         let tx = c.transaction()?;
         tx.execute(
-            "INSERT INTO groups (id, name, inactivity_secs, mode, totp_threshold_secs, lock_on_workstation_lock) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO groups (id, name, inactivity_secs, mode, totp_threshold_secs, lock_on_workstation_lock, lock_on_suspend)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(id) DO UPDATE SET name = excluded.name, inactivity_secs = excluded.inactivity_secs, mode = excluded.mode,
-                 totp_threshold_secs = excluded.totp_threshold_secs, lock_on_workstation_lock = excluded.lock_on_workstation_lock",
+                 totp_threshold_secs = excluded.totp_threshold_secs, lock_on_workstation_lock = excluded.lock_on_workstation_lock,
+                 lock_on_suspend = excluded.lock_on_suspend",
             params![
                 g.id.to_string(),
                 g.name,
                 g.inactivity_secs.map(|v| v as i64),
                 mode_code(g.mode),
                 g.totp_threshold_secs as i64,
-                i64::from(g.lock_on_workstation_lock)
+                i64::from(g.lock_on_workstation_lock),
+                i64::from(g.lock_on_suspend)
             ],
         )?;
         tx.execute("DELETE FROM group_resources WHERE group_id = ?1", params![g.id.to_string()])?;
@@ -247,6 +257,7 @@ mod tests {
             mode: InactivityMode::Combined,
             totp_threshold_secs: 12 * 3600,
             lock_on_workstation_lock: true,
+            lock_on_suspend: true,
         };
         let manual = ProtectionGroup {
             id: Uuid::new_v4(),
@@ -256,6 +267,7 @@ mod tests {
             mode: InactivityMode::ResourceIdle,
             totp_threshold_secs: 86_400,
             lock_on_workstation_lock: false,
+            lock_on_suspend: false,
         };
         {
             let s = SqliteStore::open(&db).unwrap();
@@ -306,5 +318,32 @@ mod tests {
         s.set_setting("owner_sid", "S-1-5-21-1").unwrap();
         s.set_setting("owner_sid", "S-1-5-21-2").unwrap();
         assert_eq!(s.setting("owner_sid").unwrap().as_deref(), Some("S-1-5-21-2"));
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    #[test]
+    fn banco_anterior_ganha_a_coluna_de_suspensao_sem_perder_grupos() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("old.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE groups (id TEXT PRIMARY KEY, name TEXT NOT NULL, inactivity_secs INTEGER NULL, mode INTEGER NOT NULL,
+                     totp_threshold_secs INTEGER NOT NULL, lock_on_workstation_lock INTEGER NOT NULL);
+                 INSERT INTO groups VALUES ('00000000-0000-0000-0000-000000000001', 'Antigo', 300, 1, 86400, 1);",
+            )
+            .unwrap();
+        }
+        let s = SqliteStore::open(&path).unwrap();
+        let g = s.groups().unwrap();
+        assert_eq!(g.len(), 1);
+        assert!(g[0].lock_on_workstation_lock && !g[0].lock_on_suspend);
+        drop(s);
+        // Reabrir não tenta criar a coluna de novo.
+        assert!(SqliteStore::open(&path).is_ok());
     }
 }

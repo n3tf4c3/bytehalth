@@ -106,6 +106,7 @@ impl Rig {
             mode,
             totp_threshold_secs: 86_400,
             lock_on_workstation_lock: ws,
+            lock_on_suspend: false,
         };
         let res = self.engine.save_group(g.clone()).unwrap();
         assert!(res.success, "{:?}", res.errors);
@@ -533,6 +534,7 @@ fn cadastro_rejeita_duplicado_e_grupo_invalido() {
         mode: InactivityMode::ResourceIdle,
         totp_threshold_secs: 86_400,
         lock_on_workstation_lock: false,
+        lock_on_suspend: false,
     };
     let r = rig.engine.save_group(bad).unwrap();
     assert!(!r.success && r.errors.len() >= 3, "{:?}", r.errors);
@@ -547,4 +549,62 @@ fn remover_recurso_tira_do_grupo_e_do_monitoramento() {
     rig.run(secs(120));
     assert!(!rig.locked(&d));
     assert!(rig.engine.snapshot().groups.iter().find(|x| x.id == g.id).unwrap().resource_ids.is_empty());
+}
+
+/// Contadores de E/S controlados pelo teste (a fonte real lê `IOCTL_DISK_PERFORMANCE`).
+#[derive(Default)]
+struct FakeIo(Mutex<std::collections::HashMap<Uuid, u64>>);
+
+impl bytehalt_core::inactivity::ActivityProbe for FakeIo {
+    fn counter(&self, r: &ProtectedResource) -> Option<u64> {
+        self.0.lock().unwrap().get(&r.id).copied()
+    }
+}
+
+#[test]
+fn es_real_no_volume_recomeca_a_contagem_e_volume_parado_bloqueia() {
+    let rig = Rig::new();
+    let io = Arc::new(FakeIo::default());
+    rig.engine.set_activity(io.clone());
+    let d = rig.add("Dados", "D:");
+    rig.group("G", Some(1), InactivityMode::ResourceIdle, false, &[&d]);
+    io.0.lock().unwrap().insert(d.id, 100);
+    rig.run(secs(40));
+    // Gravações aos 40 s: o contador muda e a contagem de 1 minuto recomeça.
+    io.0.lock().unwrap().insert(d.id, 130);
+    rig.run(secs(40));
+    assert!(!rig.locked(&d), "uso real aos 40 s deveria adiar o bloqueio");
+    // Volume parado (contador estável): bloqueia 1 minuto depois do último uso.
+    rig.run(secs(25));
+    assert!(rig.locked(&d));
+    assert!(rig.has(EventType::Locked, "inatividade"));
+}
+
+#[test]
+fn primeira_leitura_do_contador_nao_conta_como_uso() {
+    let rig = Rig::new();
+    let io = Arc::new(FakeIo::default());
+    rig.engine.set_activity(io.clone());
+    let d = rig.add("Dados", "D:");
+    rig.group("G", Some(1), InactivityMode::ResourceIdle, false, &[&d]);
+    // Contador já alto ao ligar a fonte: é só a base, não atividade.
+    io.0.lock().unwrap().insert(d.id, 9_999);
+    rig.run(secs(65));
+    assert!(rig.locked(&d));
+}
+
+#[test]
+fn suspender_bloqueia_so_os_grupos_com_essa_opcao() {
+    let rig = Rig::new();
+    let d = rig.add("Dados", "D:");
+    let e = rig.add("Extra", "E:");
+    let mut g = rig.group("Com suspensão", None, InactivityMode::ResourceIdle, false, &[&d]);
+    g.lock_on_suspend = true;
+    assert!(rig.engine.save_group(g).unwrap().success);
+    rig.group("Sem", None, InactivityMode::ResourceIdle, false, &[&e]);
+    rig.run(secs(5));
+    let r = rig.engine.on_suspend();
+    assert_eq!(r.len(), 1);
+    assert!(rig.locked(&d) && !rig.locked(&e));
+    assert!(rig.has(EventType::Locked, "suspensão do Windows"));
 }

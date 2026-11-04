@@ -8,8 +8,9 @@
 | `cargo test` (todos os crates) | **Windows Sandbox**: os binários são compilados no host com `cargo test --no-run` e executados só no Sandbox |
 | Prova visual da interface (GPUI), temporizadores em tempo real, falha e recuperação do serviço | **Windows Sandbox** |
 | Serviço do Windows real (LocalSystem), pipe de produção, bloqueio da estação | **Windows Sandbox** |
-| BitLocker real (unidade E: de teste) e cofres reais (VHDX + BitLocker + ponto de montagem) | **VM de teste** (VMware, rede local) por SSH + tarefa agendada local: `scripts/vm/Run-VmTests.ps1 -Test Test-RealBitLocker.ps1` ou `Test-RealVault.ps1`. O pipe de produção recusa logon de rede, por isso os casos rodam numa tarefa S4U elevada, removida ao final. Só a unidade de teste autorizada é usada. |
-| Suspensão, ETW | **VM** (Fase 4) |
+| BitLocker real (unidade E: de teste) e cofres reais (VHDX + BitLocker + ponto de montagem) | **VM de teste** (VMware, rede local) por SSH + tarefa agendada local: `scripts/vm/Run-VmTests.ps1 -Test Test-RealBitLocker.ps1` ou `Test-RealVault.ps1` ou `Test-RealActivity.ps1`. O pipe de produção recusa logon de rede, por isso os casos rodam numa tarefa S4U elevada, removida ao final. Só a unidade de teste autorizada é usada. |
+| Uso real do disco (contadores de E/S) | **VM de teste**: `Test-RealActivity.ps1` |
+| Interface com o serviço real (token comum), bloquear o Windows, suspender | **VM de teste**, na sessão interativa do usuário: `Interactive-Steps.ps1` via `Invoke-AsTask.ps1` (com aviso prévio: bloqueia a sessão e suspende a VM) |
 
 Nenhum teste altera o relógio do Windows: a regra de 24 h usa `TestClock` (parede e monotônico
 separados) e `TestBoot`. Nenhum teste toca em unidades reais: o BitLocker é exercitado por uma API

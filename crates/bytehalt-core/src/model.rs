@@ -100,6 +100,9 @@ pub struct ProtectionGroup {
     pub mode: InactivityMode,
     pub totp_threshold_secs: u64,
     pub lock_on_workstation_lock: bool,
+    /// Bloquear ao suspender ou hibernar o Windows (Fase 4).
+    #[serde(default)]
+    pub lock_on_suspend: bool,
 }
 
 impl ProtectionGroup {
@@ -226,6 +229,7 @@ mod tests {
             mode: InactivityMode::ResourceIdle,
             totp_threshold_secs: DEFAULT_TOTP_THRESHOLD_SECS,
             lock_on_workstation_lock: true,
+            lock_on_suspend: false,
         }
     }
 

@@ -284,6 +284,7 @@ pub fn build_group(
     mode: InactivityMode,
     totp_hours: &str,
     ws_lock: bool,
+    suspend_lock: bool,
     resources: Vec<Uuid>,
 ) -> Result<ProtectionGroup, String> {
     let name = name.trim();
@@ -310,6 +311,7 @@ pub fn build_group(
         mode,
         totp_threshold_secs: (hours * 3600.0).round() as u64,
         lock_on_workstation_lock: ws_lock,
+        lock_on_suspend: suspend_lock,
     })
 }
 
@@ -498,14 +500,14 @@ mod tests {
 
     #[test]
     fn editor_de_grupo_valida_como_o_servico() {
-        let ok = build_group(Uuid::nil(), "  Discos ", 2, "", InactivityMode::Combined, "24", true, vec![]).unwrap();
+        let ok = build_group(Uuid::nil(), "  Discos ", 2, "", InactivityMode::Combined, "24", true, true, vec![]).unwrap();
         assert_eq!((ok.name.as_str(), ok.inactivity_secs, ok.totp_threshold_secs), ("Discos", Some(600), 86_400));
-        assert_eq!(build_group(Uuid::nil(), "X", 0, "", InactivityMode::ResourceIdle, "1,5", false, vec![]).unwrap().totp_threshold_secs, 5400);
-        assert_eq!(build_group(Uuid::nil(), "X", OFF, "", InactivityMode::ResourceIdle, "24", false, vec![]).unwrap().inactivity_secs, None);
+        assert_eq!(build_group(Uuid::nil(), "X", 0, "", InactivityMode::ResourceIdle, "1,5", false, false, vec![]).unwrap().totp_threshold_secs, 5400);
+        assert_eq!(build_group(Uuid::nil(), "X", OFF, "", InactivityMode::ResourceIdle, "24", false, false, vec![]).unwrap().inactivity_secs, None);
         for bad in ["0", "1441", "dez"] {
-            assert!(build_group(Uuid::nil(), "X", CUSTOM, bad, InactivityMode::ResourceIdle, "24", false, vec![]).is_err());
+            assert!(build_group(Uuid::nil(), "X", CUSTOM, bad, InactivityMode::ResourceIdle, "24", false, false, vec![]).is_err());
         }
-        assert!(build_group(Uuid::nil(), " ", 0, "", InactivityMode::ResourceIdle, "24", false, vec![]).is_err());
+        assert!(build_group(Uuid::nil(), " ", 0, "", InactivityMode::ResourceIdle, "24", false, false, vec![]).is_err());
         assert_eq!(TIMEOUT_CHOICES.iter().filter_map(|c| c.1).collect::<Vec<_>>(), [1, 5, 10, 15, 30, 60]);
     }
 

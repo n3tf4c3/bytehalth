@@ -150,7 +150,10 @@ pub fn connect(name: &str, allowed_owners: &[String], timeout: Duration) -> anyh
         let h = unsafe {
             CreateFileW(
                 path.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
+                // Exatamente o que o serviço concede a usuários comuns: GENERIC_READ/WRITE incluiriam
+                // FILE_CREATE_PIPE_INSTANCE e atributos estendidos e o acesso seria NEGADO a quem não
+                // é administrador (achado na VM, Fase 4).
+                CLIENT_RIGHTS,
                 0,
                 std::ptr::null(),
                 OPEN_EXISTING,
@@ -381,6 +384,14 @@ mod tests {
         assert!(!sddl.contains(";;;WD)") && !sddl.contains(";;;BU)") && !sddl.contains(";;;AN)"), "{sddl}");
         assert_eq!(CLIENT_RIGHTS & 0x4, 0, "FILE_CREATE_PIPE_INSTANCE não pode ser concedido");
         assert_eq!(CLIENT_RIGHTS & 0x0004_0000, 0, "WRITE_DAC não pode ser concedido");
+        // O cliente pede só o que IU recebe: ler/gravar dados e atributos, ler o descritor (para conferir o
+        // dono) e sincronizar. Nada de leitura/gravação de atributos estendidos nem de criar instância.
+        for needed in [0x1u32, 0x2, 0x80, 0x100, 0x2_0000, 0x10_0000] {
+            assert_ne!(CLIENT_RIGHTS & needed, 0, "direito 0x{needed:x} faltando");
+        }
+        for forbidden in [0x4u32, 0x8, 0x10, 0x4000_0000, 0x8000_0000] {
+            assert_eq!(CLIENT_RIGHTS & forbidden, 0, "direito 0x{forbidden:x} não pode ser pedido nem concedido");
+        }
         assert!(SecurityDescriptor::from_sddl(&development_sddl(&me())).unwrap().sddl().starts_with(&format!("O:{}", me())));
     }
 

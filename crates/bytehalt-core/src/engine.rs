@@ -3,7 +3,7 @@
 
 use crate::auth::{CLOCK_TOLERANCE, LockStateStore, Requirement, StoreRead, UnlockCode, UnlockCoordinator, UnlockResult};
 use crate::clock::{Clock, UtcMillis};
-use crate::inactivity::{InactivityTracker, ReportedSessionIdle, evaluate};
+use crate::inactivity::{ActivityProbe, InactivityTracker, ReportedSessionIdle, evaluate};
 use crate::journal::{EventType, Journal, JournalEntry, Severity, append_or_log};
 use crate::locking::{LockOrchestrator, LockOutcome, LockResult, LockState, LockTrigger};
 use crate::model::{ConfigRepository, ProtectedResource, ProtectionGroup, ResourceKind};
@@ -67,6 +67,8 @@ struct Runtime {
     retry_delay: Duration,
     last_outcome: Option<LockOutcome>,
     last_detail: Option<String>,
+    /// Última leitura do contador de E/S (fonte real de atividade).
+    io: Option<u64>,
 }
 
 impl Default for Runtime {
@@ -80,6 +82,7 @@ impl Default for Runtime {
             retry_delay: Duration::ZERO,
             last_outcome: None,
             last_detail: None,
+            io: None,
         }
     }
 }
@@ -103,6 +106,7 @@ pub struct Engine {
     journal: Arc<dyn Journal>,
     clock: Arc<dyn Clock>,
     simulated: bool,
+    activity: Mutex<Option<Arc<dyn ActivityProbe>>>,
     inner: Mutex<Inner>,
 }
 
@@ -128,8 +132,14 @@ impl Engine {
             journal,
             clock,
             simulated,
+            activity: Mutex::new(None),
             inner: Mutex::new(Inner::default()),
         }
+    }
+
+    /// Liga a fonte real de atividade (contadores de E/S do volume).
+    pub fn set_activity(&self, probe: Arc<dyn ActivityProbe>) {
+        *self.activity.lock().unwrap_or_else(|e| e.into_inner()) = Some(probe);
     }
 
     pub fn simulated(&self) -> bool {
@@ -155,6 +165,7 @@ impl Engine {
         self.update_watermark(&mut inner);
         let session_idle = self.session.current();
         let now = self.clock.monotonic();
+        let probe = self.activity.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let mut results = Vec::new();
         for r in inner.resources.clone() {
             self.refresh(&mut inner, &r);
@@ -162,7 +173,16 @@ impl Engine {
             let rt = inner.runtime.entry(r.id).or_default();
             if rt.state != LockState::Unlocked {
                 rt.pending = false;
+                rt.io = None;
                 continue;
+            }
+            // E/S no volume desde a última volta = uso: o tempo de inatividade recomeça. A primeira
+            // leitura (após desbloquear ou iniciar) só serve de base.
+            if let Some(c) = probe.as_ref().and_then(|p| p.counter(&r)) {
+                if rt.io.is_some_and(|old| old != c) {
+                    self.tracker.record_activity(r.id);
+                }
+                rt.io = Some(c);
             }
             let trigger = if rt.pending {
                 (now >= rt.retry_at).then_some(LockTrigger::Retry)
@@ -196,6 +216,13 @@ impl Engine {
     pub fn on_workstation_locked(&self) -> Vec<LockResult> {
         let ids: Vec<Uuid> = self.lock_inner().policies.iter().filter(|(_, p)| p.lock_on_workstation_lock).map(|(id, _)| *id).collect();
         self.lock_resources(&ids, LockTrigger::WorkstationLock)
+    }
+
+    /// Windows suspendendo ou hibernando: bloqueia os grupos com essa opção (sem forçar; recurso em
+    /// uso fica adiado para a volta).
+    pub fn on_suspend(&self) -> Vec<LockResult> {
+        let ids: Vec<Uuid> = self.lock_inner().policies.iter().filter(|(_, p)| p.lock_on_suspend).map(|(id, _)| *id).collect();
+        self.lock_resources(&ids, LockTrigger::Suspend)
     }
 
     pub fn record_activity(&self, id: Uuid) {

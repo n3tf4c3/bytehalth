@@ -3,6 +3,7 @@
 #![cfg(windows)]
 
 pub mod acl;
+pub mod activity;
 pub mod bitlocker;
 pub mod boot;
 pub mod dpapi;

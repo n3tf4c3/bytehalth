@@ -68,8 +68,10 @@ segredos de volume; toda decisão de segurança relevante (bloquear, exigir TOTP
    administrador também pode usar a chave de recuperação ou ler protetores. Ver §5.
 8. **Chaves em memória.** Enquanto desbloqueado, a FVEK está na memória do kernel. Suspensão (S3/S0ix)
    mantém o volume desbloqueado; hibernação com volume de SO protegido é aceitável, mas volumes de
-   dados desbloqueados continuam desbloqueados ao retomar. O bloqueio em suspensão deve ser um evento
-   configurável (Fase 4).
+   dados desbloqueados continuam desbloqueados ao retomar. **Implementado (Fase 4):** opção por grupo
+   "Bloquear ao suspender ou hibernar"; o serviço trata `PBT_APMSUSPEND` (`SERVICE_CONTROL_POWEREVENT`)
+   e bloqueia ANTES de responder ao Windows (sem forçar: recurso em uso fica adiado para a volta).
+   Confirmado na VM: o E: bloqueou no instante da suspensão (S1).
 
 ## 3. Cofres VHDX — limitações
 
@@ -130,6 +132,14 @@ Limitações de projeto:
    parece atividade (ver §4).
 
 ## 4. Detecção de inatividade
+
+**Implementado (Fase 4): contadores de E/S do volume** (`IOCTL_DISK_PERFORMANCE` em `\\.\E:` ou
+`\\.\Volume{GUID}` do cofre), lidos a cada volta do serviço (5 s); contador diferente = uso e o tempo de
+inatividade recomeça. Medido na VM: 60 s parado não mexe nos contadores; gravações mexem em segundos;
+leituras atendidas pelo cache de memória **não** aparecem (mesma limitação do ETW de disco). No teste
+real, gravar a cada 20 s manteve o E: aberto por 100 s e, parado, ele bloqueou cerca de 1 min depois.
+E/S do indexador, do antivírus ou de backup no volume conta como uso; o modo "Combinado" (sessão
+ociosa) cobre quem só lê arquivos já em cache. ETW Kernel-File (filtrar processos) fica como evolução.
 
 `FileSystemWatcher` vê criação/alteração/renomeação, não leituras. Ele não serve como fonte única.
 
@@ -273,11 +283,14 @@ A interface mostra a política efetiva de cada recurso e quais grupos a originar
 - Exportação de resultados: apenas para uma pasta **nova e vazia por rodada**, criada pelo roteiro no
   host, e somente com `-ExportResults` (autorização explícita na linha de comando).
 
-## 9. Hyper-V (Fase 4)
+## 9. VM de teste (Fase 4)
 
-Virtualização está ativa no host (hipervisor presente). Testes reais de BitLocker exigem VM Windows 11
-com vTPM, discos VHDX descartáveis e nenhuma pasta do host compartilhada para gravação. Habilitar
-Hyper-V ou criar VMs depende de autorização do usuário.
+VM VMware com Windows Pro, TPM e um disco de teste (E:) autorizado pelo titular. Por SSH + tarefas
+agendadas (o pipe recusa logon de rede): BitLocker real, cofres reais, uso real do disco; na sessão
+interativa do usuário (token comum, sem elevação): interface com o serviço real, bloquear o Windows e
+suspender (S1). Achado só aí: o cliente pedia `GENERIC_READ|GENERIC_WRITE` no pipe, o que inclui
+`FILE_CREATE_PIPE_INSTANCE`; quem não era administrador elevado tinha o acesso negado. O cliente agora
+pede exatamente `0x120183`, travado por teste.
 
 ## 10. Persistência
 
@@ -300,4 +313,4 @@ Windows; interface GPUI com as 7 áreas, bandeja, notificações e temas; testes
 visual; roteiro e `.wsb` do Sandbox.
 
 Fase 2 (cofres) implementada e validada na VM de teste (§3). Fase 3 (senha mestra, TOTP e códigos de
-recuperação) implementada (§5). Fora (fases seguintes): ETW real, suspensão, VM Hyper-V (F4); instalador e assinatura (F5).
+recuperação) implementada (§5). Fase 4 (uso real do disco, bloqueio ao suspender, testes interativos na VM) implementada (§2, §4, §9). Fora (fases seguintes): instalador e assinatura (F5); ETW Kernel-File para filtrar processos (evolução da F4).

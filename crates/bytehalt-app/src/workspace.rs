@@ -53,6 +53,7 @@ pub struct GroupEditor {
     pub mode: InactivityMode,
     pub totp_hours: Entity<TextInput>,
     pub ws_lock: bool,
+    pub suspend_lock: bool,
     pub selected: HashSet<Uuid>,
     pub error: Option<String>,
 }
@@ -371,6 +372,7 @@ impl Workspace {
             mode: InactivityMode::ResourceIdle,
             totp_hours: cx.new(|cx| TextInput::new("24", "Horas", cx)),
             ws_lock: true,
+            suspend_lock: true,
             selected: HashSet::new(),
             error: None,
         });
@@ -391,6 +393,7 @@ impl Workspace {
             mode: g.mode,
             totp_hours: cx.new(|cx| TextInput::new(hours, "Horas", cx)),
             ws_lock: g.lock_on_workstation_lock,
+            suspend_lock: g.lock_on_suspend,
             selected: g.resource_ids.iter().copied().collect(),
             error: None,
         });
@@ -400,8 +403,17 @@ impl Workspace {
         let Some(e) = &mut self.editor else { return };
         let order: Vec<Uuid> =
             self.snapshot.as_ref().map(|s| s.resources.iter().map(|v| v.resource.id).filter(|id| e.selected.contains(id)).collect()).unwrap_or_default();
-        let built =
-            present::build_group(e.id, e.name.read(cx).text(), e.timeout, e.custom.read(cx).text(), e.mode, e.totp_hours.read(cx).text(), e.ws_lock, order);
+        let built = present::build_group(
+            e.id,
+            e.name.read(cx).text(),
+            e.timeout,
+            e.custom.read(cx).text(),
+            e.mode,
+            e.totp_hours.read(cx).text(),
+            e.ws_lock,
+            e.suspend_lock,
+            order,
+        );
         let group = match built {
             Ok(g) => g,
             Err(m) => {
@@ -924,12 +936,13 @@ impl Workspace {
                         .child(ui::icon("layers", 20., t.accent))
                         .child(div().flex_1().flex().flex_col().child(ui::section(g.name.clone(), &t)).child(ui::muted(
                             format!(
-                                "{} recurso(s)  ·  {}  ·  {}  ·  TOTP após {}{}",
+                                "{} recurso(s)  ·  {}  ·  {}  ·  TOTP após {}{}{}",
                                 g.resource_ids.len(),
                                 present::minutes(g.inactivity_secs),
                                 present::mode(g.mode),
                                 present::minutes(Some(g.totp_threshold_secs)),
-                                if g.lock_on_workstation_lock { "  ·  bloqueia com o Windows" } else { "" }
+                                if g.lock_on_workstation_lock { "  ·  bloqueia com o Windows" } else { "" },
+                                if g.lock_on_suspend { "  ·  bloqueia ao suspender" } else { "" }
                             ),
                             &t,
                         )))
@@ -1015,6 +1028,12 @@ impl Workspace {
                             .child(ui::checkbox("ws-lock", "Bloquear quando o Windows for bloqueado", e.ws_lock, cx).on_click(cx.listener(|ws, _, _, cx| {
                                 if let Some(e) = &mut ws.editor {
                                     e.ws_lock = !e.ws_lock;
+                                }
+                                cx.notify();
+                            })))
+                            .child(ui::checkbox("suspend-lock", "Bloquear ao suspender ou hibernar", e.suspend_lock, cx).on_click(cx.listener(|ws, _, _, cx| {
+                                if let Some(e) = &mut ws.editor {
+                                    e.suspend_lock = !e.suspend_lock;
                                 }
                                 cx.notify();
                             }))),

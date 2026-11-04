@@ -96,6 +96,8 @@ pub enum LockTrigger {
     Inactivity,
     WorkstationLock,
     Retry,
+    /// Windows suspendendo ou hibernando.
+    Suspend,
 }
 
 impl LockTrigger {
@@ -105,6 +107,7 @@ impl LockTrigger {
             Self::Inactivity => "inatividade",
             Self::WorkstationLock => "Windows bloqueado",
             Self::Retry => "nova tentativa",
+            Self::Suspend => "suspensão do Windows",
         }
     }
 }

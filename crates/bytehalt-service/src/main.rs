@@ -62,7 +62,9 @@ mod service {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
-    use windows_service::service::{ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType, SessionChangeReason};
+    use windows_service::service::{
+        PowerEventParam, ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType, SessionChangeReason,
+    };
     use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
     use windows_service::{define_windows_service, service_dispatcher};
 
@@ -119,6 +121,16 @@ mod service {
                 }
                 ServiceControlHandlerResult::NoError
             }
+            ServiceControl::PowerEvent(PowerEventParam::Suspend) => {
+                // Bloqueia ANTES de responder: o Windows espera o tratamento para suspender.
+                if let Some(host) = l.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+                    host.auth.end_all_sessions();
+                    let results = host.engine.on_suspend();
+                    eprintln!("Suspensão: {} recurso(s) processado(s).", results.len());
+                }
+                ServiceControlHandlerResult::NoError
+            }
+            ServiceControl::PowerEvent(_) => ServiceControlHandlerResult::NoError,
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
             _ => ServiceControlHandlerResult::NotImplemented,
         })?;
@@ -132,7 +144,7 @@ mod service {
             let mut server = host.serve()?;
             handle.set_service_status(status(
                 ServiceState::Running,
-                ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN | ServiceControlAccept::SESSION_CHANGE,
+                ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN | ServiceControlAccept::SESSION_CHANGE | ServiceControlAccept::POWER_EVENT,
             ))?;
             let mut next = std::time::Instant::now() + tick;
             while !stop.load(Ordering::SeqCst) {

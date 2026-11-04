@@ -110,6 +110,10 @@ impl Host {
         let unlock = UnlockCoordinator::new(state.clone(), auth.clone(), db.clone(), clock.clone(), boot);
         let session = Arc::new(ReportedSessionIdle::new(clock.clone()));
         let engine = Arc::new(Engine::new(db.clone(), orchestrator, unlock, session, state, db.clone(), clock.clone(), options.simulated));
+        if !options.simulated {
+            // Uso real: contadores de E/S de cada volume (unidades e cofres).
+            engine.set_activity(Arc::new(bytehalt_windows::activity::VolumeActivity::new(db.clone())));
+        }
         engine.reload()?;
         // Recursos de cofres que deixaram de existir (remoção concluída na recuperação).
         if let Ok(resources) = db.resources() {

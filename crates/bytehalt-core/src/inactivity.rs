@@ -41,6 +41,13 @@ impl InactivityTracker {
     }
 }
 
+/// Fonte real de atividade (Fase 4): um contador crescente de operações de E/S do volume do recurso.
+/// Contador diferente da leitura anterior = houve uso. `None` = indisponível (volume bloqueado,
+/// ausente ou fonte desligada).
+pub trait ActivityProbe: Send + Sync {
+    fn counter(&self, resource: &crate::model::ProtectedResource) -> Option<u64>;
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Decision {
     pub due: bool,

@@ -42,6 +42,7 @@ fn alterar_configuracao_exige_dono_ou_administrador() {
         mode: InactivityMode::ResourceIdle,
         totp_threshold_secs: 86_400,
         lock_on_workstation_lock: false,
+        lock_on_suspend: false,
     };
     for c in [Command::SaveGroup { group: g.clone() }, Command::DeleteGroup { id: g.id }, Command::DeleteResource { id: g.id }] {
         assert!(authorized(&c, &caller("S-1-5-21-100", false), Some("S-1-5-21-100"), false));
@@ -142,6 +143,7 @@ fn group(name: &str, ids: Vec<Uuid>, minutes: u64, ws: bool) -> ProtectionGroup 
         mode: InactivityMode::ResourceIdle,
         totp_threshold_secs: 86_400,
         lock_on_workstation_lock: ws,
+        lock_on_suspend: false,
     }
 }
 

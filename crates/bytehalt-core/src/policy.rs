@@ -14,6 +14,7 @@ pub struct EffectivePolicy {
     pub mode: InactivityMode,
     pub totp_threshold_secs: u64,
     pub lock_on_workstation_lock: bool,
+    pub lock_on_suspend: bool,
     /// Grupos que originaram a política, ordenados por id.
     pub source_groups: Vec<Uuid>,
 }
@@ -26,6 +27,7 @@ impl EffectivePolicy {
             mode: InactivityMode::ResourceIdle,
             totp_threshold_secs: DEFAULT_TOTP_THRESHOLD_SECS,
             lock_on_workstation_lock: false,
+            lock_on_suspend: false,
             source_groups: Vec::new(),
         }
     }
@@ -62,6 +64,7 @@ fn combine(owning: &[&ProtectionGroup]) -> EffectivePolicy {
         mode,
         totp_threshold_secs: owning.iter().map(|g| g.totp_threshold_secs).min().unwrap_or(DEFAULT_TOTP_THRESHOLD_SECS),
         lock_on_workstation_lock: owning.iter().any(|g| g.lock_on_workstation_lock),
+        lock_on_suspend: owning.iter().any(|g| g.lock_on_suspend),
         source_groups: owning.iter().map(|g| g.id).collect(),
     }
 }
@@ -84,6 +87,7 @@ mod tests {
             mode,
             totp_threshold_secs: totp_h * 3600,
             lock_on_workstation_lock: ws,
+            lock_on_suspend: ws,
         }
     }
 
