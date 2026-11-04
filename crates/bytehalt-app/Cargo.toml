@@ -1,0 +1,38 @@
+[package]
+name = "bytehalt-app"
+description = "Interface do ByteHalt (GPUI): painel, unidades, cofres, grupos, segurança, histórico e configurações; bandeja."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "bytehalt"
+path = "src/main.rs"
+
+[features]
+# Prova visual no Sandbox: roteiro interno com capturas (como o NetLane).
+gui-test = ["gpui/test-support", "gpui_platform/test-support"]
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+gpui.workspace = true
+gpui_platform.workspace = true
+bytehalt-core.workspace = true
+bytehalt-ipc.workspace = true
+bytehalt-windows.workspace = true
+windows-sys = { workspace = true, features = ["Win32_Graphics_Gdi"] }
+zeroize = "1"
+raw-window-handle = { version = "0.6", features = ["std"] }
+qrcode.workspace = true
+data-encoding.workspace = true
+
+[build-dependencies]
+embed-resource = "3.0"
+
+[lints]
+workspace = true

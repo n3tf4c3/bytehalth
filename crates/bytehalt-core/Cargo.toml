@@ -1,0 +1,28 @@
+[package]
+name = "bytehalt-core"
+description = "Domínio do ByteHalt: grupos, política efetiva, inatividade, bloqueio seguro e regra de 24 h. Sem dependência de Windows."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
+argon2.workspace = true
+hmac.workspace = true
+sha1.workspace = true
+subtle.workspace = true
+data-encoding.workspace = true
+getrandom.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,15 @@
+<Configuration>
+  <Networking>Disable</Networking>
+  <ClipboardRedirection>Disable</ClipboardRedirection>
+  <PrinterRedirection>Disable</PrinterRedirection>
+  <AudioInput>Disable</AudioInput>
+  <VideoInput>Disable</VideoInput>
+  <ProtectedClient>Disable</ProtectedClient>
+  <MemoryInMB>4096</MemoryInMB>
+  <MappedFolders>
+    <MappedFolder><HostFolder>C:\Codes\bytehalt\artifacts\sandbox-package</HostFolder><SandboxFolder>C:\bytehalt\pkg</SandboxFolder><ReadOnly>true</ReadOnly></MappedFolder>
+  </MappedFolders>
+  <LogonCommand>
+    <Command>powershell.exe -NoProfile -WindowStyle Minimized -ExecutionPolicy Bypass -File C:\bytehalt\pkg\scripts\Run-InsideSandbox.ps1</Command>
+  </LogonCommand>
+</Configuration>

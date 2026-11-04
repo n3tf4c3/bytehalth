@@ -1,0 +1,4 @@
+# Saídas de build e pacotes do Sandbox (target-dir em .cargo/config.toml)
+/artifacts/
+target/
+*.pdb
