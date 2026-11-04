@@ -64,7 +64,8 @@ impl Ctx {
     fn done(&mut self, code: i32, text: &str) -> i32 {
         self.note(text.to_owned());
         let log = std::env::temp_dir().join("bytehalt-setup.log");
-        let _ = std::fs::write(&log, self.log.join("\r\n"));
+        // Com a marca UTF-8 (BOM): o PowerShell 5.1 lê o arquivo sem quebrar os acentos.
+        let _ = std::fs::write(&log, [b"\xEF\xBB\xBF".as_slice(), self.log.join("\r\n").as_bytes()].concat());
         if !self.quiet {
             message(text, if code == exit::OK { MB_ICONINFORMATION } else { MB_ICONWARNING });
         }
