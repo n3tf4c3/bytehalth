@@ -133,10 +133,24 @@ impl Host {
         }
         engine.reload()?;
         // Recursos de cofres que deixaram de existir (remoção concluída na recuperação).
-        if let Ok(resources) = db.resources() {
-            for rid in vaults.orphan_resources(&resources) {
-                let _ = engine.delete_resource(rid);
+        // Sem a lista completa (de recursos ou de cofres) nada é removido: a configuração fica para reparo.
+        match db.resources().and_then(|resources| vaults.orphan_resources(&resources)) {
+            Ok(orphans) => {
+                for rid in orphans {
+                    let _ = engine.delete_resource(rid);
+                }
             }
+            Err(e) => append_or_log(
+                db.as_ref(),
+                JournalEntry {
+                    at: clock.now_utc(),
+                    event: EventType::Warning,
+                    severity: Severity::Error,
+                    resource_id: None,
+                    message: "Não foi possível ler os cofres cadastrados; nenhuma proteção de cofre foi removida.".into(),
+                    detail: Some(format!("{e:#}")),
+                },
+            ),
         }
         Ok(Self { options, engine, config: db, simulated, bitlocker, vaults, auth, clock, stop_requested: std::sync::atomic::AtomicBool::new(false) })
     }

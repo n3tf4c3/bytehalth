@@ -452,6 +452,35 @@ fn recuperacao_de_remocao_interrompida() {
             display_name: "x".into(),
             kind: bytehalt_core::model::ResourceKind::Vault,
             target: v.id.to_string(),
-        }]) == vec![uuid::Uuid::from_u128(9)]
+        }])
+        .unwrap()
+            == vec![uuid::Uuid::from_u128(9)]
     );
+}
+
+/// Lista de cofres ilegível (linha corrompida no banco).
+struct BrokenVaults;
+
+impl VaultRepository for BrokenVaults {
+    fn vaults(&self) -> anyhow::Result<Vec<VaultRecord>> {
+        anyhow::bail!("linha de cofre ilegível")
+    }
+    fn upsert_vault(&self, _: &VaultRecord) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn delete_vault(&self, _: uuid::Uuid) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// Achado de auditoria #8: sem a lista completa de cofres não se pode descartar sobreposição nem
+/// preparação em andamento.
+#[test]
+fn lista_de_cofres_ilegivel_impede_analisar_e_preparar() {
+    let w = world();
+    let m = Arc::new(VaultManager::new(w.fake.clone(), Arc::new(BrokenVaults), w.journal.clone(), Arc::new(TestClock::new()), PathRules::default()));
+    let plan = m.analyze(&path(&w.data));
+    assert!(plan.issues.iter().any(|i| i.contains("cofres")), "análise aceitou sem conseguir ler os cofres: {:?}", plan.issues);
+    assert!(m.prepare(INITIATOR, "Cliente", &path(&w.data), PASS.into(), 2 << 30).is_err(), "preparação aceita sem conseguir ler os cofres");
+    assert!(!w.fake.store.exists(), "nenhum disco pode ser criado");
 }

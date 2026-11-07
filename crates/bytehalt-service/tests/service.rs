@@ -542,3 +542,34 @@ fn senha_mestra_protege_a_configuracao_e_totp_libera_depois_de_24h() {
     assert!(s.call(Command::ResetMasterPassword { recovery_code: codes[0].clone(), new: "mais-uma-senha-1".into() }).is_err());
     assert!(s.history().iter().all(|e| !e.message.contains("senha-mestra-de-teste") && !e.message.contains(&codes[1])));
 }
+
+/// Achado de auditoria #8: uma linha de cofre ilegível no banco não pode fazer a partida do serviço
+/// tratar cofres como órfãos e apagar as proteções.
+#[test]
+fn cofre_ilegivel_no_banco_nao_remove_protecoes_na_partida() {
+    use bytehalt_core::journal::Journal;
+    use bytehalt_core::model::ConfigRepository;
+    use bytehalt_windows::sqlite::SqliteStore;
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bytehalt.db");
+    let (rid, vid) = (Uuid::new_v4(), Uuid::new_v4());
+    SqliteStore::open(&db_path)
+        .unwrap()
+        .upsert_resource(&ProtectedResource { id: rid, display_name: "Cofre".into(), kind: ResourceKind::Vault, target: vid.to_string() })
+        .unwrap();
+    rusqlite::Connection::open(&db_path).unwrap().execute("INSERT INTO vaults (id, data) VALUES (?1, '{corrompido')", [vid.to_string()]).unwrap();
+    let options = Options {
+        simulated: true,
+        development: true,
+        pipe: format!("ByteHalt.Teste.{}", Uuid::new_v4()),
+        data_dir: dir.path().to_path_buf(),
+        tick: Duration::from_secs(5),
+    };
+    drop(Host::create_with_rules(options, Arc::new(TestClock::new()), bytehalt_core::vault::PathRules::default()).unwrap());
+    let db = SqliteStore::open(&db_path).unwrap();
+    assert!(db.resources().unwrap().iter().any(|r| r.id == rid), "a proteção do cofre foi apagada na partida");
+    assert!(
+        db.recent(50).unwrap().iter().any(|e| e.message.contains("nenhuma proteção de cofre foi removida")),
+        "a falha de leitura dos cofres não ficou registrada"
+    );
+}

@@ -393,22 +393,7 @@ fn uninstall(cx: &mut Ctx, purge: bool) -> anyhow::Result<(i32, String)> {
     delete_value(HKEY_LOCAL_MACHINE, RUN_KEY, RUN_VALUE);
     delete_tree(HKEY_LOCAL_MACHINE, UNINSTALL_KEY);
     let _ = std::fs::remove_file(shortcut());
-    let dir = install_dir();
-    let me = std::env::current_exe()?;
-    let mut later = 0;
-    if dir.is_dir() {
-        for entry in walk(&dir) {
-            if same_file(&entry, &me) || (entry.is_file() && std::fs::remove_file(&entry).is_err()) {
-                delete_on_reboot(&entry);
-                later += 1;
-            }
-        }
-        for d in dirs_deepest_first(&dir) {
-            if std::fs::remove_dir(&d).is_err() {
-                delete_on_reboot(&d);
-            }
-        }
-    }
+    let later = remove_install_tree(&install_dir(), &std::env::current_exe()?);
     if purge && data.is_dir() {
         // Só exatamente <ProgramData>\ByteHalt (plan::purge_target).
         std::fs::remove_dir_all(&data).map_err(|e| anyhow::anyhow!("Apagar {}: {e}", data.display()))?;
@@ -424,26 +409,79 @@ fn uninstall(cx: &mut Ctx, purge: bool) -> anyhow::Result<(i32, String)> {
     Ok((exit::OK, text))
 }
 
+/// Link simbólico, junção ou outro ponto de nova análise: nunca é percorrido.
+fn is_link(p: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink() || m.file_attributes() & 0x400 != 0)
+}
+
+/// Pasta comum (não link).
+fn is_real_dir(p: &Path) -> bool {
+    std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir()) && !is_link(p)
+}
+
+/// Remove só o link, nunca o destino (junção e link de pasta saem com remove_dir).
+fn remove_link(p: &Path) -> std::io::Result<()> {
+    std::fs::remove_dir(p).or_else(|_| std::fs::remove_file(p))
+}
+
+/// Arquivos e links da árvore, sem entrar em links ou junções (seriam pastas de fora da instalação).
 fn walk(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
         for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
             let p = e.path();
-            if p.is_dir() { stack.push(p) } else { out.push(p) }
+            if is_real_dir(&p) { stack.push(p) } else { out.push(p) }
         }
     }
     out
 }
 
+/// Pastas comuns da árvore, da mais funda para a raiz, sem entrar em links ou junções.
 fn dirs_deepest_first(dir: &Path) -> Vec<PathBuf> {
     let mut out = vec![dir.to_path_buf()];
     let mut i = 0;
     while i < out.len() {
         let d = out[i].clone();
-        out.extend(std::fs::read_dir(&d).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_dir()));
+        out.extend(std::fs::read_dir(&d).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| is_real_dir(p)));
         i += 1;
     }
     out.reverse();
     out
 }
+
+/// Apaga a pasta de instalação sem seguir links. Devolve quantos itens ficaram para o reinício.
+fn remove_install_tree(dir: &Path, me: &Path) -> usize {
+    if is_link(dir) {
+        // A própria pasta de instalação é um link: remove só o link.
+        return usize::from(remove_link(dir).is_err());
+    }
+    if !dir.is_dir() {
+        return 0;
+    }
+    let mut later = 0;
+    for entry in walk(dir) {
+        let removed = if same_file(&entry, me) {
+            false
+        } else if is_link(&entry) {
+            remove_link(&entry).is_ok()
+        } else {
+            std::fs::remove_file(&entry).is_ok()
+        };
+        if !removed {
+            delete_on_reboot(&entry);
+            later += 1;
+        }
+    }
+    for d in dirs_deepest_first(dir) {
+        if std::fs::remove_dir(&d).is_err() {
+            delete_on_reboot(&d);
+        }
+    }
+    later
+}
+
+#[cfg(test)]
+#[path = "uninstall_tests.rs"]
+mod uninstall_tests;

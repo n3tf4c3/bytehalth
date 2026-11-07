@@ -26,6 +26,7 @@ bytehalt-windows.workspace = true
 windows-service = "0.8.1"
 
 [dev-dependencies]
+rusqlite.workspace = true
 data-encoding.workspace = true
 tempfile.workspace = true
 

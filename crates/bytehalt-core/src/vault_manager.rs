@@ -162,7 +162,14 @@ impl VaultManager {
             return plan;
         };
         plan.path = path.clone();
-        let existing = self.repo.vaults().unwrap_or_default();
+        // Sem a lista completa não dá para descartar sobreposição com um cofre existente.
+        let existing = match self.repo.vaults() {
+            Ok(v) => v,
+            Err(e) => {
+                plan.issues.push(format!("Não foi possível ler os cofres cadastrados: {e:#}"));
+                return plan;
+            }
+        };
         plan.issues.extend(path_issues(&path, &self.rules, &existing));
         let p = Path::new(&path);
         if !p.is_dir() {
@@ -216,8 +223,10 @@ impl VaultManager {
         if max_bytes < min || max_bytes > MAX_VAULT_BYTES {
             errors.push(format!("Tamanho máximo do cofre fora do intervalo ({} MiB a {} TiB).", min >> 20, MAX_VAULT_BYTES >> 40));
         }
-        if self.repo.vaults().unwrap_or_default().iter().any(|v| v.stage == VaultStage::Preparing) {
-            errors.push("Já existe um cofre em preparação.".into());
+        match self.repo.vaults() {
+            Ok(all) if all.iter().any(|v| v.stage == VaultStage::Preparing) => errors.push("Já existe um cofre em preparação.".into()),
+            Ok(_) => {}
+            Err(e) => errors.push(format!("Não foi possível ler os cofres cadastrados: {e:#}")),
         }
         if !errors.is_empty() {
             return Err(errors);
@@ -610,7 +619,24 @@ impl VaultManager {
     /// Na partida do serviço: anexa os cofres e conclui ou desfaz operações interrompidas.
     pub fn recover(&self) {
         let _x = self.exclusive.lock().unwrap_or_else(|e| e.into_inner());
-        for mut v in self.repo.vaults().unwrap_or_default() {
+        let all = match self.repo.vaults() {
+            Ok(all) => all,
+            Err(e) => {
+                append_or_log(
+                    self.journal.as_ref(),
+                    JournalEntry {
+                        at: self.clock.now_utc(),
+                        event: EventType::VaultFailed,
+                        severity: Severity::Error,
+                        resource_id: None,
+                        message: "Não foi possível ler os cofres; a recuperação de operações interrompidas foi adiada.".into(),
+                        detail: Some(format!("{e:#}")),
+                    },
+                );
+                return;
+            }
+        };
+        for mut v in all {
             let store = PathBuf::from(&v.store_path);
             match v.stage {
                 VaultStage::Preparing => {
@@ -696,14 +722,16 @@ impl VaultManager {
     }
 
     /// Recursos de bloqueio de cofres que já não existem (removidos ou concluídos na recuperação).
-    pub fn orphan_resources(&self, resources: &[crate::model::ProtectedResource]) -> Vec<Uuid> {
-        let vaults = self.repo.vaults().unwrap_or_default();
-        resources
+    /// Recursos de cofres cujo registro não existe mais. Erro se a lista de cofres não puder ser lida
+    /// por inteiro: uma linha ilegível não pode fazer cofres saudáveis parecerem órfãos.
+    pub fn orphan_resources(&self, resources: &[crate::model::ProtectedResource]) -> anyhow::Result<Vec<Uuid>> {
+        let vaults = self.repo.vaults()?;
+        Ok(resources
             .iter()
             .filter(|r| r.kind == crate::model::ResourceKind::Vault)
             .filter(|r| !vaults.iter().any(|v| v.id.to_string() == r.target))
             .map(|r| r.id)
-            .collect()
+            .collect())
     }
 }
 
