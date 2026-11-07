@@ -217,6 +217,19 @@ impl Host {
             }
             Command::DiscoverVolumes => self.discover(),
             Command::GetVaults => Reply::Vaults(self.vaults.list()),
+            Command::ClaimVaultRecovery { id } => Reply::VaultRecovery {
+                id,
+                key: self
+                    .vaults
+                    .claim_recovery(id, &caller.sid)
+                    .map_err(|_| (ErrorCode::Forbidden, "A chave só pode ser retirada pelo usuário que preparou o cofre.".into()))?,
+            },
+            Command::AckVaultRecovery { id } => {
+                self.vaults
+                    .acknowledge_recovery(id, &caller.sid)
+                    .map_err(|_| (ErrorCode::Forbidden, "A confirmação só pode ser feita pelo usuário que preparou o cofre.".into()))?;
+                Reply::Ack
+            }
             Command::StopConsole => {
                 if !self.options.development {
                     return Err((ErrorCode::Forbidden, "Só o serviço em console (portátil) pode ser encerrado pelo pipe.".into()));
@@ -239,7 +252,7 @@ impl Host {
                 self.auth.change_password(&caller.sid, &current, &new).map_err(auth_err)?;
                 Reply::Ack
             }
-            Command::RegenerateRecoveryCodes { password } => Reply::RecoveryCodes(self.auth.regenerate_recovery(&password).map_err(auth_err)?),
+            Command::RegenerateRecoveryCodes { password, proof } => Reply::RecoveryCodes(self.auth.regenerate_recovery(&password, &proof).map_err(auth_err)?),
             Command::ResetMasterPassword { recovery_code, new } => {
                 self.auth.reset_password(&caller.sid, &recovery_code, &new).map_err(auth_err)?;
                 Reply::AuthStatus(self.auth.status(&caller.sid))
@@ -257,7 +270,7 @@ impl Host {
             Command::PrepareVault { name, path, passphrase, max_bytes } => {
                 self.vaults_allowed()?;
                 self.may_replace(caller, &path)?;
-                Reply::Vault(Box::new(self.vaults.prepare(&name, &path, passphrase, max_bytes).map_err(invalid)?))
+                Reply::Vault(Box::new(self.vaults.prepare(&caller.sid, &name, &path, passphrase, max_bytes).map_err(invalid)?))
             }
             Command::SwapVault { id } => {
                 let v = self.vaults.vault(id).ok_or_else(not_found)?;
@@ -426,6 +439,8 @@ pub fn classify(c: &Command) -> Class {
         | Command::DeleteGroup { .. }
         | Command::AnalyzeVault { .. }
         | Command::PrepareVault { .. }
+        | Command::ClaimVaultRecovery { .. }
+        | Command::AckVaultRecovery { .. }
         | Command::SwapVault { .. }
         | Command::DiscardVault { .. }
         | Command::DeleteVaultReserve { .. }

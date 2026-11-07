@@ -116,6 +116,9 @@ pub struct Workspace {
     pub vault_form: VaultForm,
     pub vault_message: Option<String>,
     pub recovery: Option<RecoveryNotice>,
+    /// Só os cofres preparados por esta janela podem abrir a chave automaticamente.
+    pub recovery_queue: Vec<Uuid>,
+    pub recovery_request: Option<Uuid>,
     pub auth: Option<AuthStatus>,
     pub account: Account,
     pub master: Option<MasterPrompt>,
@@ -160,6 +163,8 @@ impl Workspace {
             vault_form: VaultForm::new(cx),
             vault_message: None,
             recovery: None,
+            recovery_queue: Vec::new(),
+            recovery_request: None,
             auth: None,
             account: Account::new(cx),
             master: None,
@@ -1226,7 +1231,12 @@ impl Workspace {
 
     fn overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let t = cx.theme().clone();
-        let dialog = if let Some(r) = self.recovery_dialog(cx).or_else(|| self.codes_dialog(cx)) {
+        let dialog = if self.recovery.is_some()
+            && let Some(m) = self.master_dialog(cx)
+        {
+            // A sessão pode expirar antes do ACK. A chave continua guardada no estado do diálogo.
+            div().child(m)
+        } else if let Some(r) = self.recovery_dialog(cx).or_else(|| self.codes_dialog(cx)) {
             // Chave e códigos de recuperação têm prioridade: não podem ser perdidos atrás de outro diálogo.
             div().child(r)
         } else if let Some(m) = self.master_dialog(cx) {

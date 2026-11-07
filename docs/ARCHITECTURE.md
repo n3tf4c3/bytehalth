@@ -86,7 +86,7 @@ pontos de montagem), `acl` (dono, grupo e DACL; acesso do chamador), `restart` (
 |---|---|---|
 | Analisar | Regras de caminho (Windows, Program Files, ProgramData, raiz e cada perfil, AppData, dados do ByteHalt, sobreposição com cofres), inventário (links, junções e arquivos só na nuvem bloqueiam), espaço (conteúdo + 10% + 256 MiB). No serviço do sistema, o **chamador** precisa ter direito de mover a pasta (AccessCheck com o token dele). | Nada é criado. |
 | Preparar | VHDX dinâmico em `<unidade>:ByteHalt.Cofres` (só SYSTEM/Administradores), anexado sem letra e com vida permanente; GPT + NTFS; BitLocker XTS-AES 256, só espaço usado, protetor de senha + chave de recuperação; espera a conversão e confere a proteção; cópia com dono, grupo, DACL, atributos e fluxos alternativos; verificação por SHA-256. | Disco descartado; original intocado. |
-| Chave de recuperação | Entregue à interface **uma vez**; nunca gravada pelo ByteHalt nem registrada. | — |
+| Chave de recuperação | Retirada explicitamente pelo SID que preparou o cofre, repetível até a confirmação de que foi guardada; nunca incluída na listagem, gravada pelo ByteHalt ou registrada. | Reinício do serviço perde a cópia pendente em memória. |
 | Trocar (confirmação) | Recusa se o Restart Manager listar programas com arquivos abertos; renomeia o original para `<pasta>.bytehalt-reserva-<data>` (o Windows recusa se houver arquivo aberto sem compartilhamento de exclusão); compara de novo por SHA-256 e reaplica o que mudou; cria a pasta vazia e monta o volume nela. | Desmonta, apaga a pasta vazia e devolve o original. |
 | Apagar reserva (confirmação) | Só a reserva criada pelo ByteHalt, ao lado do original, com o cofre ativo e montado. | Reserva mantida. |
 | Remover cofre (confirmação) | Cofre desbloqueado e sem arquivos abertos: copia de volta para `<pasta>.bytehalt-restaurando-<data>`, confere por SHA-256, desmonta, põe a cópia no caminho e só então apaga o disco. A reserva antiga não é tocada. | Cofre continua ativo; cópia parcial apagada. |
@@ -182,8 +182,17 @@ Na Fase 1 a fonte de atividade é **simulada** (`SimulatedActivitySource`) e a i
 | Autenticador | RFC 6238 (HMAC-SHA1, 6 dígitos, 30 s, ±1 passo; crates `hmac`/`sha1`, comparação em tempo constante com `subtle`). Segredo de 160 bits do gerador do sistema, QR code `otpauth://` (crate `qrcode`). O cadastro só é gravado depois do primeiro código válido. Código aceito não vale de novo. |
 | Códigos de recuperação | 10 códigos `XXXXX-XXXXX` (50 bits), mostrados uma vez, guardados só como hash Argon2id, uso único. Redefinem a senha mestra ou, junto com ela, recadastram o autenticador. |
 | Recadastrar o autenticador | Senha mestra **mais** código atual do aplicativo ou de recuperação (só a senha anularia o segundo fator). |
+| Regenerar códigos de recuperação | Senha mestra **mais** TOTP atual ainda não usado ou código de recuperação anterior. A prova é consumida junto da gravação dos novos códigos; os anteriores deixam de valer. |
 | Tentativas | 5 erros de senha ou código de recuperação ⇒ espera de 30 s, dobrando até 15 min. |
 | Armazenamento | Um arquivo `state\credentials.dat`, DPAPI de máquina com entropia própria (`ByteHalt.Credentials.v1`). Ilegível ⇒ erro (falha fechada): nunca vira "sem senha" nem permite cadastrar outra por cima. |
+
+As operações de credenciais e autenticação são serializadas pela instância compartilhada de
+`MasterAuth`: leitura, validação, consumo e gravação ficam sob o mesmo mutex. Cadastro inicial,
+troca ou redefinição de senha, regeneração de códigos e conclusão do recadastro invalidam os demais
+cadastros de autenticador pendentes; falha de persistência mantém o cadastro pendente para
+nova tentativa. O mutex não é uma transação entre processos e não cancela retroativamente comandos
+já autorizados. O contador de tentativas continua compartilhado: uma autenticação bem-sucedida o
+reinicia, portanto não há orçamento independente contra alternância de endpoints de segunda prova.
 
 Desbloqueio: senha da unidade/cofre (BitLocker) e, depois de 24 h bloqueado ou sem registro do
 bloqueio, também o código do autenticador. A senha mestra não substitui a do BitLocker: o ByteHalt
@@ -240,6 +249,15 @@ continua sem guardar senhas de volume.
   `{"version":1,"id":…,"request":{"command":…,"payload":…}}`, com `command` de uma **lista fechada**
   (`enum` com `deny_unknown_fields`). Comando desconhecido, JSON inválido ou payload fora do limite ⇒ erro, sem
   execução. Não existe comando genérico "executar".
+- `GetVaults` devolve apenas estado público. `ClaimVaultRecovery` e `AckVaultRecovery` exigem o
+  SID iniciador mesmo quando o chamador é administrador; também exigem sessão mestra quando a conta
+  está configurada. Antes do cadastro, mantém-se o fluxo inicial permitido ao iniciador. A retirada
+  não consome a chave: somente o ACK a remove da memória do serviço, permitindo retentativa após
+  perda de resposta. A interface mantém sua cópia até receber o ACK. Um reinício do serviço perde
+  as chaves pendentes; não foi criado armazenamento persistente de segredos.
+- O envelope permanece na versão 1. `RegenerateRecoveryCodes` agora exige `proof`; clientes antigos
+  sem esse campo recebem erro e a interface nova precisa dos comandos de retirada/ACK. Serviço e
+  interface devem ser atualizados juntos, sem assumir compatibilidade funcional entre versões.
 - Operações destrutivas (bloquear volume) só aceitam identificadores de recursos já cadastrados; a
   interface não envia caminhos arbitrários para o serviço agir.
 - Classes de comando: **leitura/proteção** (consultar, bloquear, desbloquear com as credenciais do

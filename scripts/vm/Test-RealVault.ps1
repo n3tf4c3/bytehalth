@@ -102,12 +102,19 @@ try {
         do {
             Start-Sleep -Milliseconds 700
             $v = V
-            if ($v.job.recoveryKey) { $script:Recovery = $v.job.recoveryKey }
         } while ($v.vault.stage -eq 'Preparing' -and (Get-Date) -lt $deadline)
-        if (-not $script:Recovery) { $v2 = V; if ($v2.job.recoveryKey) { $script:Recovery = $v2.job.recoveryKey } }
         Assert-That ($v.vault.stage -eq 'Ready') "Etapa: $($v.vault.stage) — $($v.vault.error) $($v.job.error)"
+        Assert-That ($v.job.PSObject.Properties.Name -notcontains 'recoveryKey') 'GetVaults ainda contém um campo de chave de recuperação.'
+        $claimed = P 'ClaimVaultRecovery' @{ id = $script:Vault.id }
+        Assert-That ($claimed.id -eq $script:Vault.id) 'O serviço respondeu com outro cofre.'
+        $script:Recovery = $claimed.key
         Assert-That ($script:Recovery -match '^\d{6}(-\d{6}){7}$') 'Chave de recuperação ausente ou fora do formato.'
-        Assert-That (-not (V).job.recoveryKey) 'A chave de recuperação saiu mais de uma vez.'
+        $again = P 'ClaimVaultRecovery' @{ id = $script:Vault.id }
+        Assert-That ($again.key -eq $script:Recovery) 'Repetir a solicitação antes de confirmar perdeu a chave.'
+        Assert-That (((V) | ConvertTo-Json -Depth 30) -notmatch [regex]::Escape($script:Recovery)) 'GetVaults expôs a chave.'
+        P 'AckVaultRecovery' @{ id = $script:Vault.id } | Out-Null
+        P 'AckVaultRecovery' @{ id = $script:Vault.id } | Out-Null
+        Assert-That ($null -eq (P 'ClaimVaultRecovery' @{ id = $script:Vault.id }).key) 'A chave continuou disponível após a confirmação.'
         $script:Vault = $v.vault
         Assert-That (Test-Path $v.vault.storePath) "VHDX ausente: $($v.vault.storePath)"
         $e = Enc $v.vault.volume

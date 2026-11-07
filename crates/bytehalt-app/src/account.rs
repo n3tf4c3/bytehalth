@@ -159,7 +159,7 @@ impl Workspace {
             Mode::SetupPassword => Command::BeginAuthSetup { password: pass },
             Mode::SetupCode => Command::FinishAuthSetup { code },
             Mode::Change => Command::ChangeMasterPassword { current, new: pass },
-            Mode::Regenerate => Command::RegenerateRecoveryCodes { password: current },
+            Mode::Regenerate => Command::RegenerateRecoveryCodes { password: current, proof: code },
             Mode::Forgot => Command::ResetMasterPassword { recovery_code: code, new: pass },
             Mode::TotpProof => Command::BeginTotpReset { password: current, proof: code },
             Mode::TotpCode => Command::FinishTotpReset { code },
@@ -287,7 +287,12 @@ impl Workspace {
             Mode::Change => ("Trocar a senha mestra", row(vec![field("Senha atual", &a.current), field("Nova senha", &a.pass), field("Repita a nova", &a.pass2)]), "Trocar"),
             Mode::Regenerate => (
                 "Gerar novos códigos de recuperação",
-                div().flex().flex_col().gap(px(6.)).child(row(vec![field("Senha mestra", &a.current)])).child(ui::muted("Os códigos anteriores deixam de valer.", &t)),
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(row(vec![field("Senha mestra", &a.current), field("Código atual ou de recuperação", &a.code)]))
+                    .child(ui::muted("Confirme com o autenticador atual ou um código de recuperação. Os códigos anteriores deixam de valer.", &t)),
                 "Gerar",
             ),
             Mode::Forgot => (

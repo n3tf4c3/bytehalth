@@ -254,21 +254,33 @@ fn cofre_simulado_preparar_trocar_bloquear_e_apagar_a_reserva_pelo_pipe() {
         panic!()
     };
 
-    // Acompanha a preparação; a chave de recuperação aparece numa única leitura.
-    let (mut keys, mut stage) = (0, VaultStage::Preparing);
+    // O progresso público não entrega nem consome a chave pendente.
+    let mut stage = VaultStage::Preparing;
     for _ in 0..400 {
         let Reply::Vaults(list) = s.call(Command::GetVaults).unwrap() else { panic!() };
+        assert!(!serde_json::to_string(&list).unwrap().contains("recoveryKey"));
         let view = list.into_iter().find(|x| x.vault.id == v.id).unwrap();
-        keys += usize::from(view.job.and_then(|j| j.recovery_key).is_some());
         stage = view.vault.stage;
-        if stage != VaultStage::Preparing && keys > 0 {
+        if stage != VaultStage::Preparing && view.job.is_some_and(|j| j.done) {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
     assert_eq!(stage, VaultStage::Ready);
-    let Reply::Vaults(_) = s.call(Command::GetVaults).unwrap() else { panic!() };
-    assert_eq!(keys, 1, "a chave de recuperação deve sair exatamente uma vez");
+    let Reply::VaultRecovery { id, key: Some(key) } = s.call(Command::ClaimVaultRecovery { id: v.id }).unwrap() else { panic!() };
+    assert_eq!(id, v.id);
+    assert!(!key.is_empty());
+    for _ in 0..2 {
+        let Reply::Vaults(list) = s.call(Command::GetVaults).unwrap() else { panic!() };
+        assert!(!serde_json::to_string(&list).unwrap().contains(&key));
+        let Reply::VaultRecovery { id, key: Some(retry) } = s.call(Command::ClaimVaultRecovery { id: v.id }).unwrap() else { panic!() };
+        assert_eq!(id, v.id);
+        assert!(retry == key, "nova conexão deve recuperar a mesma chave até a confirmação");
+    }
+    for _ in 0..2 {
+        assert!(matches!(s.call(Command::AckVaultRecovery { id: v.id }).unwrap(), Reply::Ack));
+    }
+    assert!(matches!(s.call(Command::ClaimVaultRecovery { id: v.id }).unwrap(), Reply::VaultRecovery { key: None, .. }));
 
     let Reply::Vault(v) = s.call(Command::SwapVault { id: v.id }).unwrap() else { panic!() };
     assert_eq!(v.stage, VaultStage::Active);
@@ -327,6 +339,153 @@ fn remover_cofre_pelo_pipe_devolve_a_pasta_e_apaga_o_recurso() {
 
 fn code_of(e: anyhow::Error) -> Option<ErrorCode> {
     e.downcast_ref::<ServiceError>().map(|s| s.code)
+}
+
+#[test]
+fn recuperacao_do_cofre_exige_sid_iniciador_e_sessao_quando_configurada() {
+    use bytehalt_core::clock::Clock;
+    use bytehalt_core::master::{STEP_SECS, totp};
+    use bytehalt_core::vault::VaultStage;
+    use bytehalt_ipc::{Request, VERSION};
+    let s = Svc::start();
+    let a = caller("S-1-5-21-111-222-333-1001", false);
+    let b = caller("S-1-5-21-111-222-333-1002", false);
+    let admin_b = caller(&b.sid, true);
+    // Identidades sintéticas percorrem a autorização real, sem criar contas do Windows.
+    let send = |command, who: &Caller| s.host.as_ref().unwrap().handle(Request { version: VERSION, id: Uuid::new_v4(), request: command }, who).result;
+    let work = tempfile::tempdir().unwrap();
+    let folder = work.path().join("Projeto");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::write(folder.join("a.txt"), b"a").unwrap();
+    let path = folder.to_string_lossy().into_owned();
+    let Reply::VaultPlan(plan) = send(Command::AnalyzeVault { path: path.clone() }, &a).unwrap() else { panic!() };
+    assert!(plan.ok());
+    let Reply::Vault(v) =
+        send(Command::PrepareVault { name: "Projeto".into(), path, passphrase: "senha-do-cofre-1".into(), max_bytes: plan.suggested_max_bytes }, &a).unwrap()
+    else {
+        panic!()
+    };
+    let mut ready = false;
+    for _ in 0..400 {
+        let Reply::Vaults(list) = send(Command::GetVaults, &b).unwrap() else { panic!() };
+        assert!(!serde_json::to_string(&list).unwrap().contains("recoveryKey"));
+        ready = list.iter().any(|x| x.vault.id == v.id && x.vault.stage == VaultStage::Ready && x.job.as_ref().is_some_and(|j| j.done));
+        if ready {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(ready, "preparação simulada deve terminar");
+    let claim = Command::ClaimVaultRecovery { id: v.id };
+    let ack = Command::AckVaultRecovery { id: v.id };
+    // Antes do cadastro, nem outro usuário nem outro administrador recebe/apaga a chave.
+    for foreign in [&b, &admin_b] {
+        for command in [claim.clone(), ack.clone()] {
+            assert_eq!(send(command, foreign).unwrap_err().0, ErrorCode::Forbidden);
+        }
+    }
+    let Reply::VaultRecovery { id, key: Some(key) } = send(claim.clone(), &a).unwrap() else { panic!() };
+    assert_eq!(id, v.id);
+    assert!(!key.is_empty());
+    let password = "senha-mestra-de-teste";
+    let Reply::Enrollment(enrollment) = send(Command::BeginAuthSetup { password: password.into() }, &a).unwrap() else { panic!() };
+    let secret = data_encoding::BASE32_NOPAD.decode(enrollment.secret.as_bytes()).unwrap();
+    let step = s.clock.now_utc().div_euclid(1000).div_euclid(STEP_SECS);
+    assert!(matches!(send(Command::FinishAuthSetup { code: totp(&secret, step) }, &a).unwrap(), Reply::RecoveryCodes(_)));
+    assert!(matches!(send(Command::EndAuthSession, &a).unwrap(), Reply::Ack));
+    for command in [claim.clone(), ack.clone()] {
+        assert_eq!(send(command.clone(), &a).unwrap_err().0, ErrorCode::AuthRequired);
+        assert_eq!(send(command, &admin_b).unwrap_err().0, ErrorCode::AuthRequired);
+    }
+    for who in [&a, &admin_b] {
+        let Reply::AuthStatus(status) = send(Command::Authenticate { password: password.into() }, who).unwrap() else { panic!() };
+        assert!(status.session_active);
+    }
+    // Sessão mestra válida de B não concede a propriedade do trabalho iniciado por A.
+    for command in [claim.clone(), ack.clone()] {
+        assert_eq!(send(command.clone(), &admin_b).unwrap_err().0, ErrorCode::Forbidden);
+        assert_eq!(send(command, &b).unwrap_err().0, ErrorCode::Forbidden);
+    }
+    for _ in 0..2 {
+        let Reply::Vaults(list) = send(Command::GetVaults, &b).unwrap() else { panic!() };
+        assert!(!serde_json::to_string(&list).unwrap().contains(&key));
+        let Reply::VaultRecovery { key: Some(retry), .. } = send(claim.clone(), &a).unwrap() else { panic!() };
+        assert!(retry == key, "listagem e recusas não podem consumir a chave");
+    }
+    for _ in 0..2 {
+        assert!(matches!(send(ack.clone(), &a).unwrap(), Reply::Ack));
+    }
+    assert!(matches!(send(claim, &a).unwrap(), Reply::VaultRecovery { key: None, .. }));
+}
+
+#[test]
+fn regeneracao_sem_prova_e_recusada_pelo_pipe() {
+    use bytehalt_core::clock::Clock;
+    use bytehalt_core::master::{RECOVERY_CODES, STEP_SECS, totp};
+    let s = Svc::start();
+    let password = "senha-mestra-de-teste";
+    let Reply::Enrollment(enrollment) = s.call(Command::BeginAuthSetup { password: password.into() }).unwrap() else { panic!() };
+    let secret = data_encoding::BASE32_NOPAD.decode(enrollment.secret.as_bytes()).unwrap();
+    let step = s.clock.now_utc().div_euclid(1000).div_euclid(STEP_SECS);
+    let Reply::RecoveryCodes(codes) = s.call(Command::FinishAuthSetup { code: totp(&secret, step) }).unwrap() else { panic!() };
+    assert_eq!(codes.len(), RECOVERY_CODES);
+    let before = std::fs::read(s.dir.path().join("state").join("credentials.dat")).unwrap();
+    // Reproduz o cliente antigo em JSON: o teste também compila no protocolo vulnerável.
+    let payload = serde_json::json!({
+        "version": bytehalt_ipc::VERSION, "id": Uuid::new_v4(),
+        "request": {"command": "RegenerateRecoveryCodes", "payload": {"password": password}}
+    });
+    let mut pipe = connect(&s.pipe, &[current_user_sid().unwrap()], Duration::from_secs(5)).unwrap();
+    bytehalt_ipc::write_frame(&mut pipe, &serde_json::to_vec(&payload).unwrap()).unwrap();
+    let bytes = bytehalt_ipc::read_frame(&mut pipe).unwrap().unwrap();
+    let response: bytehalt_ipc::Response = serde_json::from_slice(&bytes).unwrap();
+    assert!(matches!(response.result, Err((ErrorCode::BadRequest, _))), "senha sozinha regenerou códigos pelo pipe");
+    assert!(std::fs::read(s.dir.path().join("state").join("credentials.dat")).unwrap() == before);
+    let Reply::AuthStatus(status) = s.call(Command::GetAuthStatus).unwrap() else { panic!() };
+    assert!(status.configured && status.recovery_left == RECOVERY_CODES);
+}
+
+#[test]
+fn regeneracao_pelo_pipe_preserva_fatores_sem_prova_e_permite_recuperacao_legitima() {
+    use bytehalt_core::clock::Clock;
+    use bytehalt_core::master::{CredentialStore, RECOVERY_CODES, STEP_SECS, totp};
+    let s = Svc::start();
+    let password = "senha-mestra-de-teste";
+    let step = || s.clock.now_utc().div_euclid(1000).div_euclid(STEP_SECS);
+    let Reply::Enrollment(enrollment) = s.call(Command::BeginAuthSetup { password: password.into() }).unwrap() else { panic!() };
+    let original_secret = data_encoding::BASE32_NOPAD.decode(enrollment.secret.as_bytes()).unwrap();
+    let Reply::RecoveryCodes(original_codes) = s.call(Command::FinishAuthSetup { code: totp(&original_secret, step()) }).unwrap() else { panic!() };
+    assert_eq!(original_codes.len(), RECOVERY_CODES);
+    let credential_path = s.dir.path().join("state").join("credentials.dat");
+    let before = std::fs::read(&credential_path).unwrap();
+    for proof in ["", "prova-invalida"] {
+        let err = s.call(Command::RegenerateRecoveryCodes { password: password.into(), proof: proof.into() }).unwrap_err();
+        assert_eq!(code_of(err), Some(ErrorCode::Validation));
+        assert!(std::fs::read(&credential_path).unwrap() == before, "recusa não altera TOTP nem códigos persistidos");
+    }
+    let Reply::RecoveryCodes(rotated) = s.call(Command::RegenerateRecoveryCodes { password: password.into(), proof: original_codes[0].clone() }).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(rotated.len(), RECOVERY_CODES);
+    assert!(rotated.iter().all(|code| !original_codes.contains(code)));
+    // Uma chave do conjunto substituído não permite assumir o autenticador.
+    let err = s.call(Command::BeginTotpReset { password: password.into(), proof: original_codes[1].clone() }).unwrap_err();
+    assert_eq!(code_of(err), Some(ErrorCode::Validation));
+    let Reply::Enrollment(replacement) = s.call(Command::BeginTotpReset { password: password.into(), proof: rotated[0].clone() }).unwrap() else { panic!() };
+    let new_secret = data_encoding::BASE32_NOPAD.decode(replacement.secret.as_bytes()).unwrap();
+    assert!(matches!(s.call(Command::FinishTotpReset { code: totp(&new_secret, step()) }).unwrap(), Reply::Ack));
+    let store = bytehalt_windows::dpapi::DpapiCredentialStore::new(s.dir.path().join("state"), false).unwrap();
+    let credentials = store.load().unwrap().unwrap();
+    assert!(credentials.totp_secret == new_secret && credentials.totp_secret != original_secret);
+    let Reply::AuthStatus(status) = s.call(Command::GetAuthStatus).unwrap() else { panic!() };
+    assert_eq!(status.recovery_left, RECOVERY_CODES - 1);
+    // O novo autenticador funciona como segundo fator pelo mesmo pipe.
+    s.clock.advance(Duration::from_secs(STEP_SECS as u64));
+    let Reply::RecoveryCodes(next) = s.call(Command::RegenerateRecoveryCodes { password: password.into(), proof: totp(&new_secret, step()) }).unwrap() else {
+        panic!()
+    };
+    assert_eq!(next.len(), RECOVERY_CODES);
 }
 
 #[test]

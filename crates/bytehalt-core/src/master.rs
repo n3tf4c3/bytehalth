@@ -142,6 +142,11 @@ pub struct MasterAuth {
     clock: Arc<dyn Clock>,
     journal: Arc<dyn Journal>,
     inner: Mutex<Inner>,
+    // Serialize the entire load/check/consume/save operation, not individual
+    // store calls. Every handler and TOTP verifier shares this instance.
+    credentials_transaction: Mutex<()>,
+    #[cfg(test)]
+    transaction_waiters: std::sync::atomic::AtomicUsize,
 }
 
 type R<T> = Result<T, AuthError>;
@@ -206,7 +211,30 @@ fn new_recovery_code() -> String {
 
 impl MasterAuth {
     pub fn new(store: Arc<dyn CredentialStore>, clock: Arc<dyn Clock>, journal: Arc<dyn Journal>) -> Self {
-        Self { store, clock, journal, inner: Mutex::new(Inner::default()) }
+        Self {
+            store,
+            clock,
+            journal,
+            inner: Mutex::new(Inner::default()),
+            credentials_transaction: Mutex::new(()),
+            #[cfg(test)]
+            transaction_waiters: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn transaction(&self) -> std::sync::MutexGuard<'_, ()> {
+        // Tests witness a contender before releasing a paused store read;
+        // the production lock remains the only synchronization mechanism.
+        #[cfg(test)]
+        self.transaction_waiters.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let guard = self.credentials_transaction.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(test)]
+        self.transaction_waiters.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        guard
+    }
+
+    fn invalidate_pending(&self) {
+        self.inner().pending.clear();
     }
 
     fn inner(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -267,7 +295,6 @@ impl MasterAuth {
     fn check_password(&self, c: &Credentials, password: &str) -> R<()> {
         self.throttle()?;
         if verify_secret(password, &c.password) {
-            self.succeeded();
             Ok(())
         } else {
             self.failed();
@@ -303,11 +330,13 @@ impl MasterAuth {
     }
 
     pub fn end_session(&self, sid: &str) {
+        let _transaction = self.transaction();
         self.inner().sessions.remove(sid);
     }
 
     /// Bloquear o Windows encerra todas as sessões de configuração.
     pub fn end_all_sessions(&self) {
+        let _transaction = self.transaction();
         self.inner().sessions.clear();
     }
 
@@ -337,6 +366,7 @@ impl MasterAuth {
 
     /// 1º passo do cadastro: valida a senha nova e gera o segredo (ainda não gravado).
     pub fn begin_setup(&self, sid: &str, password: &str) -> R<Enrollment> {
+        let _transaction = self.transaction();
         if self.load()?.is_some() {
             return Err(AuthError::AlreadyConfigured);
         }
@@ -349,6 +379,7 @@ impl MasterAuth {
     /// 2º passo: o primeiro código do aplicativo confirma o cadastro. Devolve os códigos de
     /// recuperação (exibidos uma vez) e abre a sessão de configuração.
     pub fn finish_setup(&self, sid: &str, code: &str) -> R<Vec<String>> {
+        let _transaction = self.transaction();
         if self.load()?.is_some() {
             return Err(AuthError::AlreadyConfigured);
         }
@@ -368,7 +399,12 @@ impl MasterAuth {
             recovery: codes.iter().map(|c| hash_secret(&normalize_code(c))).collect(),
             created_at: self.clock.now_utc(),
         };
-        self.save(&creds)?;
+        if let Err(error) = self.save(&creds) {
+            self.inner().pending.insert(sid.to_owned(), pending);
+            return Err(error);
+        }
+        self.invalidate_pending();
+        self.succeeded();
         self.open_session(sid);
         self.log(EventType::ConfigurationChanged, Severity::Info, "Senha mestra e autenticador cadastrados.");
         Ok(codes)
@@ -376,12 +412,15 @@ impl MasterAuth {
 
     /// Abre a sessão de configuração (15 min) para este usuário do Windows.
     pub fn authenticate(&self, sid: &str, password: &str) -> R<u64> {
+        let _transaction = self.transaction();
         let c = self.creds()?;
         self.check_password(&c, password)?;
+        self.succeeded();
         Ok(self.open_session(sid))
     }
 
     pub fn change_password(&self, sid: &str, current: &str, new: &str) -> R<()> {
+        let _transaction = self.transaction();
         let mut c = self.creds()?;
         self.check_password(&c, current)?;
         if let Some(m) = password_issues(new) {
@@ -389,17 +428,25 @@ impl MasterAuth {
         }
         c.password = hash_secret(new);
         self.save(&c)?;
+        self.invalidate_pending();
+        self.succeeded();
         self.open_session(sid);
         self.log(EventType::ConfigurationChanged, Severity::Info, "Senha mestra alterada.");
         Ok(())
     }
 
-    pub fn regenerate_recovery(&self, password: &str) -> R<Vec<String>> {
+    /// Replacing recovery codes requires possession of the existing second
+    /// factor; otherwise a password alone could bootstrap a TOTP reset.
+    pub fn regenerate_recovery(&self, password: &str, proof: &str) -> R<Vec<String>> {
+        let _transaction = self.transaction();
         let mut c = self.creds()?;
         self.check_password(&c, password)?;
+        self.consume_second_factor(&mut c, proof)?;
         let codes: Vec<String> = (0..RECOVERY_CODES).map(|_| new_recovery_code()).collect();
         c.recovery = codes.iter().map(|x| hash_secret(&normalize_code(x))).collect();
         self.save(&c)?;
+        self.invalidate_pending();
+        self.succeeded();
         self.log(EventType::ConfigurationChanged, Severity::Info, "Novos códigos de recuperação gerados; os anteriores deixaram de valer.");
         Ok(codes)
     }
@@ -411,7 +458,6 @@ impl MasterAuth {
         match c.recovery.iter().position(|h| verify_secret(&n, h)) {
             Some(i) => {
                 c.recovery.remove(i);
-                self.succeeded();
                 Ok(())
             }
             None => {
@@ -424,6 +470,7 @@ impl MasterAuth {
 
     /// Esqueceu a senha mestra: um código de recuperação permite criar outra.
     pub fn reset_password(&self, sid: &str, recovery_code: &str, new: &str) -> R<usize> {
+        let _transaction = self.transaction();
         let mut c = self.creds()?;
         if let Some(m) = password_issues(new) {
             return Err(AuthError::Weak(m));
@@ -431,28 +478,42 @@ impl MasterAuth {
         self.consume_recovery(&mut c, recovery_code)?;
         c.password = hash_secret(new);
         self.save(&c)?;
+        self.invalidate_pending();
+        self.succeeded();
         self.open_session(sid);
         self.log(EventType::ConfigurationChanged, Severity::Warning, "Senha mestra redefinida com código de recuperação.");
         Ok(c.recovery.len())
     }
 
+    fn consume_second_factor(&self, c: &mut Credentials, proof: &str) -> R<()> {
+        self.throttle()?;
+        let p = normalize_code(proof);
+        if p.len() == DIGITS as usize && p.chars().all(|x| x.is_ascii_digit()) {
+            let Some(step) = self.matching_step(&c.totp_secret, &p).filter(|s| *s > c.last_step) else {
+                self.failed();
+                return Err(AuthError::BadCode);
+            };
+            c.last_step = step;
+        } else {
+            self.consume_recovery(c, proof)?;
+        }
+        Ok(())
+    }
+
     /// Recadastrar o autenticador (celular novo ou perdido): senha mestra + código atual do
     /// aplicativo OU um código de recuperação. Só a senha não basta: senão ela anularia o TOTP.
     pub fn begin_totp_reset(&self, sid: &str, password: &str, proof: &str) -> R<Enrollment> {
+        let _transaction = self.transaction();
         let mut c = self.creds()?;
         self.check_password(&c, password)?;
-        let p = normalize_code(proof);
-        if p.len() == DIGITS as usize && p.chars().all(|x| x.is_ascii_digit()) {
-            let step = self.matching_step(&c.totp_secret, &p).filter(|s| *s > c.last_step).ok_or(AuthError::BadCode)?;
-            c.last_step = step;
-        } else {
-            self.consume_recovery(&mut c, proof)?;
-        }
+        self.consume_second_factor(&mut c, proof)?;
         self.save(&c)?;
+        self.succeeded();
         Ok(self.enrollment(sid, PendingKind::TotpReset))
     }
 
     pub fn finish_totp_reset(&self, sid: &str, code: &str) -> R<()> {
+        let _transaction = self.transaction();
         let mut c = self.creds()?;
         let now = self.clock.monotonic();
         let pending = self.inner().pending.remove(sid).filter(|p| p.until > now).ok_or(AuthError::NoPending)?;
@@ -465,7 +526,12 @@ impl MasterAuth {
         };
         c.totp_secret = pending.secret.to_vec();
         c.last_step = step;
-        self.save(&c)?;
+        if let Err(error) = self.save(&c) {
+            self.inner().pending.insert(sid.to_owned(), pending);
+            return Err(error);
+        }
+        self.invalidate_pending();
+        self.succeeded();
         self.log(EventType::ConfigurationChanged, Severity::Warning, "Autenticador recadastrado.");
         Ok(())
     }
@@ -478,6 +544,7 @@ impl TotpVerifier for MasterAuth {
 
     /// Código do desbloqueio: aceito uma única vez (o passo precisa ser posterior ao último usado).
     fn verify(&self, code: &str) -> bool {
+        let _transaction = self.transaction();
         let Ok(Some(mut c)) = self.load() else { return false };
         match self.matching_step(&c.totp_secret, code) {
             Some(step) if step > c.last_step => {
@@ -598,7 +665,7 @@ mod tests {
         assert_eq!(a.reset_password("S-1", &codes[0].to_lowercase().replace('-', " "), "nova-senha-mestra-1").unwrap(), 9);
         assert_eq!(a.reset_password("S-1", &codes[0], "outra-senha-mestra-2").unwrap_err(), AuthError::BadCode);
         assert!(a.authenticate("S-1", "nova-senha-mestra-1").is_ok());
-        let fresh = a.regenerate_recovery("nova-senha-mestra-1").unwrap();
+        let fresh = a.regenerate_recovery("nova-senha-mestra-1", &codes[1]).unwrap();
         assert_eq!(a.reset_password("S-1", &codes[1], "outra-senha-mestra-2").unwrap_err(), AuthError::BadCode, "antigos invalidados");
         assert_eq!(a.status("S-1").recovery_left, 10);
         assert!(a.reset_password("S-1", &fresh[3], "outra-senha-mestra-2").is_ok());
@@ -620,3 +687,7 @@ mod tests {
         assert_eq!(a.status("S-1").recovery_left, 9);
     }
 }
+
+#[cfg(test)]
+#[path = "master/audit_tests.rs"]
+mod audit_tests;

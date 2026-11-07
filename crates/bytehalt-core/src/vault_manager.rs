@@ -48,8 +48,6 @@ pub struct JobView {
     pub total_bytes: u64,
     pub done: bool,
     pub error: Option<String>,
-    /// Chave de recuperação do BitLocker: entregue UMA vez (a leitura seguinte não a traz).
-    pub recovery_key: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,7 +60,17 @@ pub struct VaultView {
 #[derive(Default)]
 struct Job {
     view: JobView,
+    /// Identidade obtida pelo serviço, nunca pelo payload do cliente.
+    initiator_sid: String,
     recovery: Option<String>,
+}
+
+impl Drop for Job {
+    fn drop(&mut self) {
+        if let Some(key) = self.recovery.as_mut() {
+            key.zeroize();
+        }
+    }
 }
 
 pub struct VaultManager {
@@ -99,25 +107,45 @@ impl VaultManager {
         self.repo.vaults().ok()?.into_iter().find(|v| v.id == id)
     }
 
-    /// Cofres com o andamento da preparação. A chave de recuperação sai daqui uma única vez.
+    /// Cofres com o andamento da preparação, sem entregar nem consumir segredos.
     pub fn list(&self) -> Vec<VaultView> {
-        let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        let jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
         let mut out: Vec<VaultView> = self
             .repo
             .vaults()
             .unwrap_or_default()
             .into_iter()
             .map(|vault| {
-                let job = jobs.get_mut(&vault.id).map(|j| {
-                    let mut view = j.view.clone();
-                    view.recovery_key = j.recovery.take();
-                    view
-                });
+                let job = jobs.get(&vault.id).map(|j| j.view.clone());
                 VaultView { vault, job }
             })
             .collect();
         out.sort_by_key(|v| v.vault.created_at);
         out
+    }
+
+    /// Retirada explícita pelo iniciador, após autenticação no serviço. Conserva a chave até o ACK
+    /// para que uma resposta perdida no pipe não torne a recuperação irrecuperável.
+    pub fn claim_recovery(&self, id: Uuid, caller_sid: &str) -> Result<Option<String>, Fail> {
+        let jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        let job = jobs
+            .get(&id)
+            .filter(|job| !caller_sid.is_empty() && job.initiator_sid == caller_sid)
+            .ok_or_else(|| one("Chave de recuperação indisponível para este usuário."))?;
+        Ok(job.recovery.clone())
+    }
+
+    /// Confirmação explícita do iniciador de que guardou a chave. Repetir o ACK é seguro.
+    pub fn acknowledge_recovery(&self, id: Uuid, caller_sid: &str) -> Result<(), Fail> {
+        let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        let job = jobs
+            .get_mut(&id)
+            .filter(|job| !caller_sid.is_empty() && job.initiator_sid == caller_sid)
+            .ok_or_else(|| one("Chave de recuperação indisponível para este usuário."))?;
+        if let Some(mut key) = job.recovery.take() {
+            key.zeroize();
+        }
+        Ok(())
     }
 
     pub fn analyze(&self, raw: &str) -> VaultPlan {
@@ -172,7 +200,10 @@ impl VaultManager {
     }
 
     /// Inicia a preparação em segundo plano. A senha só é usada para criar o protetor do BitLocker.
-    pub fn prepare(self: &Arc<Self>, name: &str, raw_path: &str, passphrase: String, max_bytes: u64) -> Result<VaultRecord, Fail> {
+    pub fn prepare(self: &Arc<Self>, initiator_sid: &str, name: &str, raw_path: &str, passphrase: String, max_bytes: u64) -> Result<VaultRecord, Fail> {
+        if initiator_sid.trim().is_empty() {
+            return Err(one("Usuário iniciador não identificado."));
+        }
         let _x = self.exclusive.lock().unwrap_or_else(|e| e.into_inner());
         let plan = self.analyze(raw_path);
         let mut errors = plan.issues.clone();
@@ -212,7 +243,11 @@ impl VaultManager {
         self.save(&record)?;
         self.jobs.lock().unwrap_or_else(|e| e.into_inner()).insert(
             id,
-            Job { view: JobView { step: "Criando o disco do cofre".into(), total_bytes: plan.inventory.bytes, ..Default::default() }, recovery: None },
+            Job {
+                view: JobView { step: "Criando o disco do cofre".into(), total_bytes: plan.inventory.bytes, ..Default::default() },
+                initiator_sid: initiator_sid.to_owned(),
+                recovery: None,
+            },
         );
         self.log(EventType::VaultChanged, Severity::Info, &record, format!("Cofre \"{}\": preparação iniciada para {}.", record.name, record.original_path));
         let me = self.clone();

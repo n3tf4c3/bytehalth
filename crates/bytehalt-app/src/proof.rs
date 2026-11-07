@@ -562,9 +562,12 @@ async fn vault_steps(this: &This, cx: &mut AsyncWindowContext, p: &mut Proof) {
         if let Some(r) = &mut ws.recovery {
             r.saved = true;
         }
-        ws.recovery = None;
-        cx.notify();
+        ws.acknowledge_vault_recovery(cx);
     });
+    let acknowledged = until(this, cx, 15, |ws| ws.recovery.is_none()).await;
+    p.record(V, "Recebimento da chave confirmado pelo serviço", s, check(shown && acknowledged, format!("chave mostrada {shown}, confirmação {acknowledged}")));
+
+    let s = Instant::now();
     let ready = until(this, cx, 30, |ws| vault_of(ws).is_some_and(|v| v.vault.stage == VaultStage::Ready)).await;
     shot(p, cx, "cofre-pronto").await;
     let original_intact = folder.join("README.md").exists() && !std::fs::symlink_metadata(&folder).is_ok_and(|m| m.file_type().is_symlink());
@@ -708,6 +711,7 @@ async fn auth_steps(this: &This, cx: &mut AsyncWindowContext, p: &mut Proof) {
     let shown = until(this, cx, 15, |ws| ws.codes.is_some()).await;
     shot(p, cx, "codigos-recuperacao").await;
     let n = this.update(cx, |ws, _| ws.codes.as_ref().map_or(0, |c| c.codes.len())).unwrap_or(0);
+    let previous_code = this.update(cx, |ws, _| ws.codes.as_ref().and_then(|c| c.codes.first().cloned())).ok().flatten().unwrap_or_default();
     let _ = this.update(cx, |ws, cx| {
         ws.codes = None;
         ws.refresh_auth(cx);
@@ -719,6 +723,33 @@ async fn auth_steps(this: &This, cx: &mut AsyncWindowContext, p: &mut Proof) {
         s,
         check(shown && n == 10 && active, format!("códigos {n}, sessão {active}")),
     );
+
+    let s = Instant::now();
+    let _ = this.update(cx, |ws, cx| {
+        ws.set_account_mode(Mode::Regenerate, cx);
+        ws.account.current.update(cx, |i, cx| i.set_text(PASS, cx));
+        ws.account_submit(cx);
+    });
+    let missing_proof_refused = until(this, cx, 15, |ws| {
+        !ws.account.busy && ws.codes.is_none() && ws.account.message.as_ref().is_some_and(|(_, tone)| matches!(tone, crate::present::Tone::Danger))
+    })
+    .await;
+    let _ = this.update(cx, |ws, cx| {
+        ws.account.current.update(cx, |i, cx| i.set_text(PASS, cx));
+        ws.account.code.update(cx, |i, cx| i.set_text(previous_code.clone(), cx));
+        ws.account_submit(cx);
+    });
+    let regenerated = until(this, cx, 15, |ws| ws.codes.as_ref().is_some_and(|c| c.codes.len() == 10 && !c.codes.contains(&previous_code))).await;
+    p.record(
+        S,
+        "Regenerar exige prova atual e aceita código anterior",
+        s,
+        check(missing_proof_refused && regenerated, format!("sem prova recusado {missing_proof_refused}, novos códigos {regenerated}")),
+    );
+    let _ = this.update(cx, |ws, cx| {
+        ws.codes = None;
+        cx.notify();
+    });
 
     let s = Instant::now();
     let _ = this.update(cx, |ws, cx| ws.end_auth_session(cx));

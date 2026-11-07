@@ -77,6 +77,14 @@ pub enum Command {
     },
     /// Cofres (Fase 2). Analisar e preparar exigem que o chamador possa substituir a pasta.
     GetVaults,
+    /// Retira a chave pendente apenas para o SID que iniciou a preparação.
+    /// Repetível até a confirmação explícita de recebimento.
+    ClaimVaultRecovery {
+        id: Uuid,
+    },
+    AckVaultRecovery {
+        id: Uuid,
+    },
     AnalyzeVault {
         path: String,
     },
@@ -124,6 +132,7 @@ pub enum Command {
     },
     RegenerateRecoveryCodes {
         password: String,
+        proof: String,
     },
     /// Esqueceu a senha mestra: um código de recuperação (uso único) permite criar outra.
     ResetMasterPassword {
@@ -160,6 +169,8 @@ impl Command {
             Self::SimulateActivity { .. } => "SimulateActivity",
             Self::SimulateVolume { .. } => "SimulateVolume",
             Self::GetVaults => "GetVaults",
+            Self::ClaimVaultRecovery { .. } => "ClaimVaultRecovery",
+            Self::AckVaultRecovery { .. } => "AckVaultRecovery",
             Self::AnalyzeVault { .. } => "AnalyzeVault",
             Self::PrepareVault { .. } => "PrepareVault",
             Self::SwapVault { .. } => "SwapVault",
@@ -194,14 +205,14 @@ impl Command {
             Self::PrepareVault { name, passphrase, .. } if name.len() > 512 || passphrase.len() > 1024 => {
                 Err("Nome ou senha fora do tamanho permitido.".into())
             }
-            Self::BeginAuthSetup { password } | Self::Authenticate { password } | Self::RegenerateRecoveryCodes { password } if password.len() > 1024 => {
-                Err("Senha fora do tamanho permitido.".into())
-            }
+            Self::BeginAuthSetup { password } | Self::Authenticate { password } if password.len() > 1024 => Err("Senha fora do tamanho permitido.".into()),
             Self::ChangeMasterPassword { current, new } if current.len() > 1024 || new.len() > 1024 => Err("Senha fora do tamanho permitido.".into()),
             Self::ResetMasterPassword { recovery_code, new } if recovery_code.len() > 64 || new.len() > 1024 => {
                 Err("Credencial fora do tamanho permitido.".into())
             }
-            Self::BeginTotpReset { password, proof } if password.len() > 1024 || proof.len() > 64 => Err("Credencial fora do tamanho permitido.".into()),
+            Self::BeginTotpReset { password, proof } | Self::RegenerateRecoveryCodes { password, proof } if password.len() > 1024 || proof.len() > 64 => {
+                Err("Credencial fora do tamanho permitido.".into())
+            }
             Self::FinishAuthSetup { code } | Self::FinishTotpReset { code } if code.len() > 64 => Err("Código fora do tamanho permitido.".into()),
             _ => Ok(()),
         }
@@ -245,6 +256,10 @@ pub enum Reply {
         warning: Option<String>,
     },
     Vaults(Vec<bytehalt_core::vault_manager::VaultView>),
+    VaultRecovery {
+        id: Uuid,
+        key: Option<String>,
+    },
     VaultPlan(Box<bytehalt_core::vault_manager::VaultPlan>),
     Vault(Box<bytehalt_core::vault::VaultRecord>),
     AuthStatus(bytehalt_core::master::AuthStatus),
@@ -444,5 +459,39 @@ mod tests {
         assert!(s.contains(r#""command":"LockGroup""#) && s.contains(r#""payload":{"id":"#), "{s}");
         let back: Request = serde_json::from_str(&s).unwrap();
         assert_eq!(back, r);
+    }
+
+    #[test]
+    fn regeneracao_exige_prova_no_payload_e_respeita_limites() {
+        // JSON bruto mantém esta regressão executável contra o protocolo antigo.
+        let mut body = serde_json::json!({
+            "version": VERSION, "id": Uuid::new_v4(),
+            "request": {"command": "RegenerateRecoveryCodes", "payload": {"password": "senha-mestra-de-teste"}}
+        });
+        let missing = parse_request(&serde_json::to_vec(&body).unwrap());
+        assert!(matches!(missing, Err(Response { result: Err((ErrorCode::BadRequest, _)), .. })), "senha sem prova foi aceita");
+        body["request"]["payload"]["proof"] = serde_json::json!("ABCDE-FGHIJ");
+        let accepted = parse_request(&serde_json::to_vec(&body).unwrap()).unwrap();
+        assert_eq!(accepted.request.name(), "RegenerateRecoveryCodes");
+        assert_eq!(serde_json::to_value(accepted).unwrap()["request"]["payload"]["proof"], "ABCDE-FGHIJ");
+        body["request"]["payload"]["proof"] = serde_json::json!("x".repeat(65));
+        assert_eq!(parse_request(&serde_json::to_vec(&body).unwrap()).unwrap_err().result.unwrap_err().0, ErrorCode::Validation);
+    }
+
+    #[test]
+    fn retirada_e_confirmacao_de_chave_preservam_identificador_no_protocolo() {
+        let vault = Uuid::new_v4();
+        for command in [Command::ClaimVaultRecovery { id: vault }, Command::AckVaultRecovery { id: vault }] {
+            let request = Request { version: VERSION, id: Uuid::new_v4(), request: command };
+            assert_eq!(parse_request(&serde_json::to_vec(&request).unwrap()).unwrap(), request);
+        }
+        for key in [Some("chave-sintetica".to_string()), None] {
+            let response = Response { version: VERSION, id: Some(Uuid::new_v4()), result: Ok(Reply::VaultRecovery { id: vault, key: key.clone() }) };
+            let back: Response = serde_json::from_slice(&serde_json::to_vec(&response).unwrap()).unwrap();
+            assert_eq!(back.id, response.id);
+            let Ok(Reply::VaultRecovery { id, key: returned }) = back.result else { panic!() };
+            assert_eq!(id, vault);
+            assert_eq!(returned, key);
+        }
     }
 }

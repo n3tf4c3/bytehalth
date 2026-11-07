@@ -14,6 +14,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const PASS: &str = "senha-de-teste-123";
+const INITIATOR: &str = "S-1-5-21-111-222-333-1001";
+const OTHER_USER: &str = "S-1-5-21-111-222-333-1002";
+const RECOVERY: &str = "111111-222222-333333-444444-555555-666666-777777-888888";
 
 #[derive(Default)]
 struct Fake {
@@ -60,7 +63,7 @@ impl VaultPlatform for Fake {
     }
     fn encrypt(&self, _: &str, passphrase: &str) -> anyhow::Result<String> {
         assert_eq!(passphrase, PASS);
-        Ok("111111-222222-333333-444444-555555-666666-777777-888888".into())
+        Ok(RECOVERY.into())
     }
     fn volume_root(&self, volume: &str) -> PathBuf {
         PathBuf::from(volume)
@@ -135,7 +138,7 @@ fn wait_ready(w: &World, id: uuid::Uuid) -> VaultRecord {
 }
 
 fn prepare(w: &World) -> VaultRecord {
-    let v = w.m.prepare("Cliente", &path(&w.data), PASS.into(), 2 << 30).unwrap();
+    let v = w.m.prepare(INITIATOR, "Cliente", &path(&w.data), PASS.into(), 2 << 30).unwrap();
     assert_eq!(v.stage, VaultStage::Preparing);
     wait_ready(w, v.id)
 }
@@ -145,7 +148,7 @@ fn same_content(a: &Path, b: &Path) -> Vec<String> {
 }
 
 #[test]
-fn preparacao_copia_verifica_e_entrega_a_chave_uma_vez() {
+fn preparacao_copia_verifica_e_retem_chave_ate_confirmacao() {
     let w = world();
     let before = migrate::manifest(&w.data, true).unwrap();
     let v = prepare(&w);
@@ -155,9 +158,80 @@ fn preparacao_copia_verifica_e_entrega_a_chave_uma_vez() {
     assert!(same_content(&w.data, &root).is_empty());
     // O original não foi tocado.
     assert!(migrate::diff(&before, &migrate::manifest(&w.data, true).unwrap()).is_empty());
-    let first = w.m.list();
-    assert!(first[0].job.as_ref().unwrap().recovery_key.as_deref().is_some_and(|k| k.starts_with("111111")));
-    assert!(w.m.list()[0].job.as_ref().unwrap().recovery_key.is_none(), "a chave só pode sair uma vez");
+    assert_eq!(w.m.claim_recovery(v.id, INITIATOR).unwrap().as_deref(), Some(RECOVERY));
+    assert_eq!(w.m.claim_recovery(v.id, INITIATOR).unwrap().as_deref(), Some(RECOVERY), "resposta perdida pode ser repetida");
+    w.m.acknowledge_recovery(v.id, INITIATOR).unwrap();
+    assert!(w.m.claim_recovery(v.id, INITIATOR).unwrap().is_none(), "depois da confirmação a chave não sai mais");
+}
+
+#[test]
+fn listagem_serializada_nao_expoe_chave_de_recuperacao() {
+    let w = world();
+    let v = prepare(&w);
+    assert_eq!(v.stage, VaultStage::Ready);
+    let views = w.m.list();
+    assert_eq!(views.len(), 1, "a listagem continua entregando o cofre autorizado");
+    assert_eq!(views[0].vault.id, v.id);
+    assert!(views[0].job.as_ref().unwrap().done);
+    let serialized = serde_json::to_string(&views).unwrap();
+    assert!(!serialized.contains("111111"), "a listagem expôs a chave de recuperação");
+    assert!(!serialized.contains("recoveryKey"), "o contrato público de andamento ainda contém segredo");
+}
+
+#[test]
+fn chave_so_pode_ser_retirada_e_confirmada_pelo_iniciador() {
+    let w = world();
+    let v = prepare(&w);
+    assert_eq!(v.stage, VaultStage::Ready);
+    for _ in 0..3 {
+        assert_eq!(w.m.list()[0].vault.id, v.id);
+        assert!(w.m.claim_recovery(v.id, OTHER_USER).is_err());
+        assert!(w.m.acknowledge_recovery(v.id, OTHER_USER).is_err());
+        assert!(w.m.claim_recovery(v.id, "").is_err());
+        assert!(w.m.acknowledge_recovery(v.id, "").is_err());
+        assert_eq!(w.m.claim_recovery(v.id, INITIATOR).unwrap().as_deref(), Some(RECOVERY), "consulta ou ACK estrangeiro consumiu a chave");
+    }
+    assert!(!serde_json::to_string(&w.repo.vaults().unwrap()).unwrap().contains(RECOVERY), "o segredo não pode ser persistido no registro do cofre");
+    assert!(!serde_json::to_string(&w.journal.entries()).unwrap().contains(RECOVERY), "o segredo não pode entrar no journal");
+    w.m.acknowledge_recovery(v.id, INITIATOR).unwrap();
+    w.m.acknowledge_recovery(v.id, INITIATOR).unwrap();
+    assert!(w.m.claim_recovery(v.id, INITIATOR).unwrap().is_none());
+    assert!(w.m.claim_recovery(uuid::Uuid::new_v4(), INITIATOR).is_err());
+    assert!(w.m.acknowledge_recovery(uuid::Uuid::new_v4(), INITIATOR).is_err());
+}
+
+#[test]
+fn retiradas_concorrentes_nao_consumem_chave_antes_da_confirmacao() {
+    let w = world();
+    let v = prepare(&w);
+    assert_eq!(v.stage, VaultStage::Ready);
+    let start = Arc::new(std::sync::Barrier::new(8));
+    let calls: Vec<_> = (0..8)
+        .map(|_| {
+            let manager = w.m.clone();
+            let start = start.clone();
+            std::thread::spawn(move || {
+                start.wait();
+                manager.claim_recovery(v.id, INITIATOR).unwrap()
+            })
+        })
+        .collect();
+    for call in calls {
+        assert_eq!(call.join().unwrap().as_deref(), Some(RECOVERY), "retirada consumiu o segredo antes do ACK");
+    }
+    w.m.acknowledge_recovery(v.id, INITIATOR).unwrap();
+    assert!(w.m.claim_recovery(v.id, INITIATOR).unwrap().is_none());
+}
+
+#[test]
+fn preparacao_sem_iniciador_nao_cria_cofre_nem_arquivos() {
+    let w = world();
+    for sid in ["", " "] {
+        assert!(w.m.prepare(sid, "Cliente", &path(&w.data), PASS.into(), 2 << 30).is_err());
+        assert!(w.repo.vaults().unwrap().is_empty());
+        assert!(!w.fake.store.exists());
+    }
+    assert_eq!(prepare(&w).stage, VaultStage::Ready, "um iniciador identificado continua podendo preparar");
 }
 
 #[test]
@@ -225,7 +299,7 @@ fn falha_ao_montar_desfaz_a_troca() {
 fn falha_na_preparacao_descarta_o_disco_e_nao_toca_no_original() {
     let w = world();
     w.fake.fail_format.store(true, Ordering::SeqCst);
-    let v = w.m.prepare("Cliente", &path(&w.data), PASS.into(), 2 << 30).unwrap();
+    let v = w.m.prepare(INITIATOR, "Cliente", &path(&w.data), PASS.into(), 2 << 30).unwrap();
     let v = wait_ready(&w, v.id);
     assert_eq!(v.stage, VaultStage::Failed);
     assert!(v.error.unwrap().contains("Formatar"));
@@ -293,15 +367,15 @@ fn recuperacao_desfaz_troca_interrompida_e_descarta_preparacao_interrompida() {
 #[test]
 fn preparacao_recusa_caminho_proibido_senha_curta_e_sobreposicao() {
     let w = world();
-    let err = w.m.prepare("X", &path(&w.data), "curta".into(), 2 << 30).unwrap_err().join(" ");
+    let err = w.m.prepare(INITIATOR, "X", &path(&w.data), "curta".into(), 2 << 30).unwrap_err().join(" ");
     assert!(err.contains("pelo menos 8"), "{err}");
-    let err = w.m.prepare("X", "relativo\\pasta", PASS.into(), 2 << 30).unwrap_err().join(" ");
+    let err = w.m.prepare(INITIATOR, "X", "relativo\\pasta", PASS.into(), 2 << 30).unwrap_err().join(" ");
     assert!(err.contains("pasta local completa"), "{err}");
-    let err = w.m.prepare("X", &path(&w.data), PASS.into(), 1 << 20).unwrap_err().join(" ");
+    let err = w.m.prepare(INITIATOR, "X", &path(&w.data), PASS.into(), 1 << 20).unwrap_err().join(" ");
     assert!(err.contains("Tamanho máximo"), "{err}");
     let v = prepare(&w);
     w.m.swap(v.id).unwrap();
-    let err = w.m.prepare("Y", &path(&w.data.join("src")), PASS.into(), 2 << 30).unwrap_err().join(" ");
+    let err = w.m.prepare(INITIATOR, "Y", &path(&w.data.join("src")), PASS.into(), 2 << 30).unwrap_err().join(" ");
     assert!(err.contains("Sobrepõe"), "{err}");
     let plan = w.m.analyze(&path(w.data.parent().unwrap()));
     assert!(!plan.ok());

@@ -2,6 +2,7 @@
 //! vez), acompanhar a cópia verificada, trocar a pasta pelo cofre, apagar a reserva, bloquear e
 //! desbloquear. Toda operação de disco acontece no serviço; aqui só há pedidos pelo pipe.
 
+use crate::client::Failure;
 use crate::present::{self, Tone};
 use crate::text_input::TextInput;
 use crate::theme::{ActiveTheme, UI_FONT};
@@ -12,6 +13,7 @@ use bytehalt_core::vault::VaultStage;
 use bytehalt_core::vault_manager::{VaultPlan, VaultView};
 use bytehalt_ipc::{Command, Reply};
 use gpui::{AnyElement, ClipboardItem, Context, Entity, FontWeight, IntoElement, PathPromptOptions, SharedString, div, prelude::*, px};
+use uuid::Uuid;
 
 pub struct VaultForm {
     pub path: Entity<TextInput>,
@@ -37,24 +39,92 @@ impl VaultForm {
 
 /// Chave de recuperação recém-criada: fica na tela até o usuário confirmar que guardou.
 pub struct RecoveryNotice {
+    pub id: Uuid,
     pub name: String,
     pub key: String,
     pub saved: bool,
     pub copied: bool,
+    pub acknowledging: bool,
+    pub message: Option<String>,
+}
+
+/// Uma resposta perdida ao confirmar não pode apagar a única cópia visível da chave.
+fn complete_recovery_ack(recovery: &mut Option<RecoveryNotice>, id: Uuid, result: Result<Reply, Failure>) -> bool {
+    let Some(notice) = recovery.as_mut().filter(|notice| notice.id == id) else { return false };
+    notice.acknowledging = false;
+    match result {
+        Ok(Reply::Ack) => {
+            *recovery = None;
+            true
+        }
+        Ok(_) => {
+            notice.message = Some("O serviço não confirmou o recebimento. A chave continua nesta tela; tente novamente.".into());
+            false
+        }
+        Err(failure) => {
+            notice.message = Some(format!("{} A chave continua nesta tela; tente confirmar novamente.", failure.text()));
+            false
+        }
+    }
 }
 
 impl Workspace {
     pub fn refresh_vaults(&mut self, cx: &mut Context<Self>) {
-        self.send(Command::GetVaults, cx, |ws, r, _| {
+        self.send(Command::GetVaults, cx, |ws, r, cx| {
             if let Ok(Reply::Vaults(list)) = r {
-                for v in &list {
-                    if let Some(key) = v.job.as_ref().and_then(|j| j.recovery_key.clone())
-                        && ws.recovery.is_none()
-                    {
-                        ws.recovery = Some(RecoveryNotice { name: v.vault.name.clone(), key, saved: false, copied: false });
-                    }
-                }
                 ws.vaults = list;
+                ws.claim_next_created_recovery(cx);
+            }
+        });
+    }
+
+    fn claim_next_created_recovery(&mut self, cx: &mut Context<Self>) {
+        if self.recovery.is_some() || self.recovery_request.is_some() || !self.auth.as_ref().is_some_and(|auth| !auth.configured || auth.session_active) {
+            return;
+        }
+        self.recovery_queue.retain(|id| !self.vaults.iter().any(|v| v.vault.id == *id && v.vault.stage == VaultStage::Failed));
+        if let Some(id) = self
+            .recovery_queue
+            .iter()
+            .find(|id| self.vaults.iter().any(|v| v.vault.id == **id && v.vault.stage == VaultStage::Ready && v.job.as_ref().is_some_and(|j| j.done)))
+            .copied()
+        {
+            // Uma tentativa por criação; falha de transporte/autenticação tem retentativa explícita.
+            self.recovery_queue.retain(|queued| *queued != id);
+            self.request_vault_recovery(id, cx);
+        }
+    }
+
+    pub fn request_vault_recovery(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        if self.recovery.is_some() || self.recovery_request.is_some() {
+            return;
+        }
+        let Some(name) = self.vaults.iter().find(|v| v.vault.id == id).map(|v| v.vault.name.clone()) else { return };
+        self.recovery_request = Some(id);
+        self.send(Command::ClaimVaultRecovery { id }, cx, move |ws, result, _| {
+            ws.recovery_request = None;
+            match result {
+                Ok(Reply::VaultRecovery { id: received, key: Some(key) }) if received == id => {
+                    ws.recovery = Some(RecoveryNotice { id, name, key, saved: false, copied: false, acknowledging: false, message: None });
+                    ws.vault_message = None;
+                }
+                Ok(Reply::VaultRecovery { id: received, key: None }) if received == id => {
+                    ws.vault_message = Some("A chave não está disponível: ela já foi confirmada ou o serviço foi reiniciado.".into());
+                }
+                Ok(_) => ws.vault_message = Some("Resposta inesperada ao solicitar a chave de recuperação.".into()),
+                Err(failure) => ws.vault_message = Some(failure.text()),
+            }
+        });
+    }
+
+    pub fn acknowledge_vault_recovery(&mut self, cx: &mut Context<Self>) {
+        let Some(notice) = self.recovery.as_mut().filter(|notice| notice.saved && !notice.acknowledging) else { return };
+        let id = notice.id;
+        notice.acknowledging = true;
+        notice.message = None;
+        self.send(Command::AckVaultRecovery { id }, cx, move |ws, result, cx| {
+            if complete_recovery_ack(&mut ws.recovery, id, result) {
+                ws.claim_next_created_recovery(cx);
             }
         });
     }
@@ -116,6 +186,7 @@ impl Workspace {
             ws.vault_form.busy = false;
             match r {
                 Ok(Reply::Vault(v)) => {
+                    queue_created_recovery(&mut ws.recovery_queue, v.id);
                     ws.vault_message = Some(format!("Cofre \"{}\" em preparação. A pasta original não é alterada até você confirmar a troca.", v.name));
                     ws.vault_form.plan = None;
                     ws.vault_form.path.update(cx, |i, cx| i.set_text("", cx));
@@ -249,6 +320,13 @@ impl Workspace {
         let row = v.resource_id.and_then(|rid| rows.iter().find(|r| r.id == rid));
         let (id, name, path) = (v.id, v.name.clone(), v.original_path.clone());
         let mut actions = div().flex().gap(px(6.)).flex_none();
+        if matches!(v.stage, VaultStage::Ready | VaultStage::Active) {
+            let can_claim = self.recovery.is_none() && self.recovery_request.is_none();
+            actions = actions.child(
+                ui::button(SharedString::from(format!("recovery-{id}")), "Ver chave de recuperação", Kind::Secondary, can_claim, cx)
+                    .when(can_claim, |button| button.on_click(cx.listener(move |ws, _, _, cx| ws.request_vault_recovery(id, cx)))),
+            );
+        }
         match v.stage {
             VaultStage::Ready => {
                 let (n, p) = (name.clone(), path.clone());
@@ -366,7 +444,7 @@ impl Workspace {
                 .shadow_lg()
                 .child(ui::section(format!("Chave de recuperação do cofre \"{}\"", r.name), &t))
                 .child(div().text_size(px(13.)).child(
-                    "Esta é a única vez que o ByteHalt mostra esta chave. Ela abre o cofre se você esquecer a senha. Guarde fora deste computador (gerenciador de senhas ou papel).",
+                    "Esta chave abre o cofre se você esquecer a senha. Guarde fora deste computador (gerenciador de senhas ou papel). Depois de confirmar, o ByteHalt deixa de entregá-la.",
                 ))
                 .child(
                     div()
@@ -396,22 +474,29 @@ impl Workspace {
                             )),
                         )
                         .child(ui::checkbox("recovery-saved", "Guardei a chave em lugar seguro", r.saved, cx).on_click(cx.listener(|ws, _, _, cx| {
-                            if let Some(r) = &mut ws.recovery {
+                            if let Some(r) = &mut ws.recovery && !r.acknowledging {
                                 r.saved = !r.saved;
                             }
                             cx.notify();
                         }))),
                 )
                 .child(
-                    div().flex().justify_end().child(ui::button("recovery-done", "Continuar", Kind::Primary, r.saved, cx).when(r.saved, |b| {
-                        b.on_click(cx.listener(|ws, _, _, cx| {
-                            ws.recovery = None;
-                            cx.notify();
-                        }))
-                    })),
+                    div().flex().justify_end().child(
+                        ui::button("recovery-done", if r.acknowledging { "Confirmando…" } else { "Continuar" }, Kind::Primary, r.saved && !r.acknowledging, cx)
+                            .when(r.saved && !r.acknowledging, |button| {
+                                button.on_click(cx.listener(|ws, _, _, cx| ws.acknowledge_vault_recovery(cx)))
+                            }),
+                    ),
                 )
+                .when_some(r.message.clone(), |dialog, message| dialog.child(ui::notice(message, Tone::Danger, &t)))
                 .into_any_element(),
         )
+    }
+}
+
+fn queue_created_recovery(queue: &mut Vec<Uuid>, id: Uuid) {
+    if !queue.contains(&id) {
+        queue.push(id);
     }
 }
 
@@ -442,4 +527,67 @@ pub fn confirm_text(c: &Confirm) -> Option<(String, String, &'static str)> {
         ),
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn awaiting_ack(id: Uuid) -> Option<RecoveryNotice> {
+        Some(RecoveryNotice {
+            id,
+            name: "Cofre de teste".into(),
+            key: "chave-sintetica-retida".into(),
+            saved: true,
+            copied: true,
+            acknowledging: true,
+            message: None,
+        })
+    }
+
+    #[test]
+    fn lost_ack_response_keeps_key_until_successful_retry() {
+        let id = Uuid::new_v4();
+        let mut recovery = awaiting_ack(id);
+        assert!(!complete_recovery_ack(&mut recovery, id, Err(Failure::Unavailable)));
+        let notice = recovery.as_ref().unwrap();
+        assert_eq!(notice.id, id);
+        assert_eq!(notice.key, "chave-sintetica-retida");
+        assert!(notice.saved && notice.copied);
+        assert!(!notice.acknowledging);
+        assert!(notice.message.is_some());
+        assert!(!notice.message.as_ref().unwrap().contains(&notice.key));
+        assert!(complete_recovery_ack(&mut recovery, id, Ok(Reply::Ack)));
+        assert!(recovery.is_none());
+    }
+
+    #[test]
+    fn expired_session_or_unexpected_reply_does_not_dismiss_key() {
+        let id = Uuid::new_v4();
+        let mut recovery = awaiting_ack(id);
+        assert!(!complete_recovery_ack(&mut recovery, id, Err(Failure::AuthRequired("Abra a sessão".into()))));
+        assert_eq!(recovery.as_ref().unwrap().key, "chave-sintetica-retida");
+        assert!(!complete_recovery_ack(&mut recovery, id, Ok(Reply::VaultRecovery { id, key: None })));
+        assert!(recovery.is_some());
+    }
+
+    #[test]
+    fn ack_for_another_vault_cannot_dismiss_current_key() {
+        let id = Uuid::new_v4();
+        let mut recovery = awaiting_ack(id);
+        assert!(!complete_recovery_ack(&mut recovery, Uuid::new_v4(), Ok(Reply::Ack)));
+        assert_eq!(recovery.as_ref().unwrap().id, id);
+        assert!(recovery.as_ref().unwrap().acknowledging);
+    }
+
+    #[test]
+    fn created_vault_queue_preserves_multiple_keys_without_duplicate_requests() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let mut queue = Vec::new();
+        queue_created_recovery(&mut queue, first);
+        queue_created_recovery(&mut queue, second);
+        queue_created_recovery(&mut queue, first);
+        assert_eq!(queue, vec![first, second]);
+    }
 }
