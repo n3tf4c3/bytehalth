@@ -87,7 +87,7 @@ pontos de montagem), `acl` (dono, grupo e DACL; acesso do chamador), `restart` (
 | Analisar | Regras de caminho (Windows, Program Files, ProgramData, raiz e cada perfil, AppData, dados do ByteHalt, sobreposição com cofres), inventário (links, junções e arquivos só na nuvem bloqueiam), espaço (conteúdo + 10% + 256 MiB). No serviço do sistema, o **chamador** precisa ter direito de mover a pasta (AccessCheck com o token dele). | Nada é criado. |
 | Preparar | VHDX dinâmico em `<unidade>:ByteHalt.Cofres` (só SYSTEM/Administradores), anexado sem letra e com vida permanente; GPT + NTFS; BitLocker XTS-AES 256, só espaço usado, protetor de senha + chave de recuperação; espera a conversão e confere a proteção; cópia com dono, grupo, DACL, atributos e fluxos alternativos; verificação por SHA-256. | Disco descartado; original intocado. |
 | Chave de recuperação | Retirada explicitamente pelo SID que preparou o cofre, repetível até a confirmação de que foi guardada; nunca incluída na listagem, gravada pelo ByteHalt ou registrada. | Reinício do serviço perde a cópia pendente em memória. |
-| Trocar (confirmação) | Recusa se o Restart Manager listar programas com arquivos abertos; renomeia o original para `<pasta>.bytehalt-reserva-<data>` (o Windows recusa se houver arquivo aberto sem compartilhamento de exclusão); compara de novo por SHA-256 e reaplica o que mudou; cria a pasta vazia e monta o volume nela. | Desmonta, apaga a pasta vazia e devolve o original. |
+| Trocar (confirmação) | Recusa se o Restart Manager listar programas com arquivos abertos; renomeia o original para `<pasta>.bytehalt-reserva-<data>` (o Windows recusa se houver arquivo aberto sem compartilhamento de exclusão); compara de novo por SHA-256 e reaplica o que mudou; compara os fluxos alternativos (arquivos, pastas e raiz) e regrava os diferentes; reaplica dono e DACL em **todos** os itens (permissão revogada depois da preparação não muda o SHA-256); cria a pasta vazia e monta o volume nela. | Desmonta, apaga a pasta vazia e devolve o original. |
 | Apagar reserva (confirmação) | Só a reserva criada pelo ByteHalt, ao lado do original, com o cofre ativo e montado. | Reserva mantida. |
 | Remover cofre (confirmação) | Cofre desbloqueado e sem arquivos abertos: copia de volta para `<pasta>.bytehalt-restaurando-<data>`, confere por SHA-256, desmonta, põe a cópia no caminho e só então apaga o disco. A reserva antiga não é tocada. | Cofre continua ativo; cópia parcial apagada. |
 
@@ -319,6 +319,14 @@ pede exatamente `0x120183`, travado por teste.
 | Senha mestra (hash), segredo TOTP, hashes de recuperação | `%ProgramData%\ByteHalt\state\credentials.dat` | DPAPI escopo máquina + entropia própria; Argon2id |
 | Cofres (caminhos, etapa, volume; sem senha nem chave) | tabela `vaults` do SQLite | idem SQLite |
 | Discos dos cofres | `<unidade>:\ByteHalt.Cofres\<id>.vhdx` | ACL: SYSTEM e Administradores; conteúdo cifrado pelo BitLocker |
+
+As pastas `%ProgramData%\ByteHalt` e `<unidade>:\ByteHalt.Cofres` são preparadas por `secure_dir`: criadas já com
+dono Administradores e DACL protegida numa única chamada. Se a pasta já existir, ela é aberta sem seguir links e
+só é adotada quando o dono é SYSTEM, Administradores ou a conta do próprio serviço (o dono tem WRITE_DAC
+implícito); caso contrário é renomeada para `<pasta>.nao-confiavel-<segundos>` (nada é apagado) e recriada,
+com aviso no histórico. Numa pasta adotada, dono e DACL são reaplicados pelo handle (que impede a troca da pasta
+por um link até o fim) e cada item dentro é conferido: link ou junção, dono não confiável ou hard link fazem o
+serviço recusar o uso da pasta (falha fechada, com o caminho do item).
 
 Logs e histórico nunca contêm segredo TOTP, código, senha nem chave de recuperação.
 

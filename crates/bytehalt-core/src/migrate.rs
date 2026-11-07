@@ -307,6 +307,110 @@ pub fn resync(src: &Path, dst: &Path, changed: &[String], gone: &[String], secur
     Ok(())
 }
 
+/// Fluxos alternativos por item (caminho relativo; `""` é a raiz): nome do fluxo → SHA-256.
+/// Só itens com algum fluxo aparecem.
+pub type Streams = BTreeMap<String, BTreeMap<String, [u8; 32]>>;
+
+fn item(root: &Path, name: &str) -> PathBuf {
+    if name.is_empty() { root.to_path_buf() } else { root.join(name) }
+}
+
+fn stream_path(p: &Path, stream: &str) -> PathBuf {
+    let mut s = p.as_os_str().to_owned();
+    s.push(":");
+    s.push(stream);
+    PathBuf::from(s)
+}
+
+/// Fluxos alternativos da raiz e de cada item do manifesto (listados pela plataforma, lidos aqui).
+pub fn streams(root: &Path, manifest: &Manifest, security: &dyn SecurityCopier) -> io::Result<Streams> {
+    let mut out = Streams::new();
+    for name in std::iter::once("").chain(manifest.keys().map(String::as_str)) {
+        let path = item(root, name);
+        let mut found = BTreeMap::new();
+        for s in security.streams(&path)? {
+            found.insert(s.clone(), hash_file(&stream_path(&path, &s))?);
+        }
+        if !found.is_empty() {
+            out.insert(name.to_owned(), found);
+        }
+    }
+    Ok(out)
+}
+/// Itens cujos fluxos alternativos diferem (nomes, conteúdo, faltando ou sobrando).
+pub fn stream_diff(source: &Streams, copy: &Streams) -> Vec<String> {
+    let mut names: Vec<&String> = source.keys().chain(copy.keys()).collect();
+    names.sort();
+    names.dedup();
+    names.into_iter().filter(|n| source.get(*n) != copy.get(*n)).map(|n| format!("Fluxos alternativos diferentes: {n}")).collect()
+}
+
+/// Deixa os fluxos alternativos da cópia iguais aos da origem. Arquivo: copiado de novo por inteiro
+/// (dados, fluxos e segurança). Pasta ou raiz: cada fluxo é regravado e os que sobram, removidos.
+pub fn sync_streams(src: &Path, dst: &Path, manifest: &Manifest, source: &Streams, copy: &Streams, security: &dyn SecurityCopier) -> io::Result<()> {
+    let empty = BTreeMap::new();
+    let mut names: Vec<&String> = source.keys().chain(copy.keys()).collect();
+    names.sort();
+    names.dedup();
+    for name in names {
+        let (want, have) = (source.get(name).unwrap_or(&empty), copy.get(name).unwrap_or(&empty));
+        if want == have {
+            continue;
+        }
+        let (from, to) = (item(src, name), item(dst, name));
+        if manifest.get(name).is_some_and(|e| !e.dir) {
+            fs::remove_file(&to)?;
+            copy_item(&from, &to, security)?;
+            continue;
+        }
+        for stream in have.keys().filter(|s| !want.contains_key(*s)) {
+            fs::remove_file(stream_path(&to, stream))?;
+        }
+        for (stream, hash) in want {
+            if have.get(stream) != Some(hash) {
+                let mut r = open_for_backup(&stream_path(&from, stream))?;
+                let mut w = fs::File::create(stream_path(&to, stream))?;
+                io::copy(&mut r, &mut w)?;
+                w.sync_all()?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reaplica dono e DACL da origem em TODOS os itens da cópia, inclusive os de conteúdo inalterado:
+/// uma permissão revogada depois da preparação não muda tamanho nem SHA-256. Pastas da mais funda
+/// para a raiz; a raiz como raiz de volume.
+pub fn reapply_security(src: &Path, dst: &Path, manifest: &Manifest, security: &dyn SecurityCopier) -> io::Result<()> {
+    for (name, _) in manifest.iter().filter(|(_, e)| !e.dir) {
+        security.copy(&src.join(name), &dst.join(name))?;
+    }
+    for (name, _) in manifest.iter().rev().filter(|(_, e)| e.dir) {
+        security.copy(&src.join(name), &dst.join(name))?;
+    }
+    security.copy_root(src, dst)
+}
+
+/// Fluxos iguais entre origem e cópia, regravando o que diferir e conferindo de novo. `items` é o
+/// manifesto da origem; a comparação de conteúdo já garantiu que a cópia tem os mesmos itens.
+pub fn verify_streams(src: &Path, dst: &Path, items: &Manifest, security: &dyn SecurityCopier) -> Result<(), String> {
+    let read = |p: &Path, what: &str| streams(p, items, security).map_err(|e| format!("Ler os fluxos alternativos {what}: {e}"));
+    let (a, b) = (read(src, "do original")?, read(dst, "da cópia")?);
+    if stream_diff(&a, &b).is_empty() {
+        return Ok(());
+    }
+    sync_streams(src, dst, items, &a, &b, security).map_err(|e| format!("Atualizar os fluxos alternativos: {e}"))?;
+    let again = stream_diff(&read(src, "do original")?, &read(dst, "da cópia")?);
+    if !again.is_empty() {
+        return Err(format!(
+            "Os fluxos alternativos da cópia não conferem ({} item(ns)): {}",
+            again.len(),
+            again.iter().take(3).cloned().collect::<Vec<_>>().join("; ")
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -26,6 +26,71 @@ impl SecurityCopier for FileSecurity {
     fn copy_root(&self, from: &Path, to: &Path) -> std::io::Result<()> {
         self.apply(from, to, true)
     }
+
+    fn streams(&self, path: &Path) -> std::io::Result<Vec<String>> {
+        named_streams(path)
+    }
+}
+
+/// Fluxos de dados com nome (`arquivo:nome`) de um arquivo ou pasta, sem seguir links. Aberto com
+/// FILE_FLAG_BACKUP_SEMANTICS: no serviço (SeBackupPrivilege) lê mesmo sem permissão na DACL.
+pub fn named_streams(path: &Path) -> std::io::Result<Vec<String>> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileStreamInfo,
+        GetFileInformationByHandleEx,
+    };
+    let f = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let mut buf = vec![0u64; 512];
+    loop {
+        let bytes = (buf.len() * 8) as u32;
+        // SAFETY: handle válido; buffer alinhado a 8 bytes com o tamanho informado.
+        if unsafe { GetFileInformationByHandleEx(f.as_raw_handle() as HANDLE, FileStreamInfo, buf.as_mut_ptr() as _, bytes) } != 0 {
+            break;
+        }
+        // SAFETY: lido logo após a chamada.
+        match unsafe { windows_sys::Win32::Foundation::GetLastError() } {
+            // ERROR_HANDLE_EOF: nenhum fluxo (pasta sem fluxos).
+            38 => return Ok(Vec::new()),
+            // ERROR_MORE_DATA.
+            234 if buf.len() < 1 << 20 => buf.resize(buf.len() * 4, 0),
+            _ => return Err(std::io::Error::last_os_error()),
+        }
+    }
+    // FILE_STREAM_INFO: NextEntryOffset u32, StreamNameLength u32, StreamSize i64,
+    // StreamAllocationSize i64, StreamName [u16] (sem nulo). Lido byte a byte do buffer.
+    // SAFETY: buffer próprio, reinterpretado como bytes.
+    let raw = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 8) };
+    let u32_at = |at: usize| u32::from_le_bytes([raw[at], raw[at + 1], raw[at + 2], raw[at + 3]]) as usize;
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    loop {
+        if at + 24 > raw.len() {
+            return Err(std::io::Error::other("lista de fluxos inválida"));
+        }
+        let (next, len) = (u32_at(at), u32_at(at + 4));
+        if at + 24 + len > raw.len() {
+            return Err(std::io::Error::other("lista de fluxos inválida"));
+        }
+        let name: Vec<u16> = raw[at + 24..at + 24 + len].as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
+        let name = String::from_utf16_lossy(&name);
+        // ":nome:$DATA"; o principal é "::$DATA".
+        if let Some(n) = name.strip_prefix(':').and_then(|n| n.strip_suffix(":$DATA"))
+            && !n.is_empty()
+        {
+            out.push(n.to_owned());
+        }
+        if next == 0 {
+            break;
+        }
+        at += next;
+    }
+    Ok(out)
 }
 
 const INHERITED_ACE: u8 = 0x10;

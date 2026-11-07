@@ -341,6 +341,8 @@ impl VaultManager {
         if !d.is_empty() {
             return Err(format!("A cópia não confere com o original ({} diferença(s)): {}", d.len(), d.iter().take(3).cloned().collect::<Vec<_>>().join("; ")));
         }
+        // A cópia de arquivo leva os fluxos alternativos; os de pastas e da raiz, não.
+        migrate::verify_streams(&src, &root, &a, self.platform.security())?;
         v.files = a.values().filter(|x| !x.dir).count() as u64;
         v.bytes = a.values().map(|x| x.size).sum();
         Ok(recovery)
@@ -427,15 +429,20 @@ impl VaultManager {
         let sec = self.platform.security();
         // O original pode ter mudado entre a preparação e a troca: compara por SHA-256 e reaplica.
         let read = |p: &Path, what: &str| migrate::manifest(p, true).map_err(|e| format!("Ler {what}: {e}"));
-        let (src, copy) = (read(reserve, "o original")?, read(&root, "o cofre")?);
+        let (mut src, copy) = (read(reserve, "o original")?, read(&root, "o cofre")?);
         if !migrate::diff(&src, &copy).is_empty() {
             let (changed, gone) = migrate::to_resync(&src, &copy);
             migrate::resync(reserve, &root, &changed, &gone, sec).map_err(|e| format!("Atualizar a cópia: {e}"))?;
-            let again = migrate::diff(&read(reserve, "o original")?, &read(&root, "o cofre")?);
+            src = read(reserve, "o original")?;
+            let again = migrate::diff(&src, &read(&root, "o cofre")?);
             if !again.is_empty() {
                 return Err(format!("A cópia não confere com o original ({} diferença(s)).", again.len()));
             }
         }
+        // Mudanças só de permissão ou de fluxos alternativos não alteram tamanho nem SHA-256: os
+        // fluxos são comparados e a segurança é reaplicada em todos os itens antes de montar.
+        migrate::verify_streams(reserve, &root, &src, sec)?;
+        migrate::reapply_security(reserve, &root, &src, sec).map_err(|e| format!("Reaplicar as permissões: {e}"))?;
         fs::create_dir(original).map_err(|e| format!("Criar a pasta de montagem: {e}"))?;
         let _ = sec.copy(reserve, original);
         self.platform.mount(volume, original).map_err(|e| format!("Montar o cofre: {e:#}"))?;

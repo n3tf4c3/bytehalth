@@ -72,12 +72,26 @@ impl Host {
 
     /// Como `create`, com regras de caminho dos cofres explícitas (testes).
     pub fn create_with_rules(options: Options, clock: Arc<dyn Clock>, rules: PathRules) -> anyhow::Result<Self> {
-        if options.development {
+        let prepared = if options.development {
             std::fs::create_dir_all(&options.data_dir)?;
+            None
         } else {
-            secure_dir::ensure_machine_only(&options.data_dir)?;
-        }
+            Some(secure_dir::ensure_machine_only(&options.data_dir)?)
+        };
         let db = Arc::new(SqliteStore::open(&options.data_dir.join("bytehalt.db"))?);
+        if let Some(secure_dir::Prepared::Quarantined(aside)) = &prepared {
+            append_or_log(
+                db.as_ref(),
+                JournalEntry {
+                    at: clock.now_utc(),
+                    event: EventType::Warning,
+                    severity: Severity::Warning,
+                    resource_id: None,
+                    message: "A pasta de dados já existia com dono não confiável; foi posta de lado e recriada.".into(),
+                    detail: Some(aside.display().to_string()),
+                },
+            );
+        }
         let state: Arc<dyn LockStateStore> = Arc::new(DpapiStateStore::new(options.data_dir.join("state"), !options.development)?);
         let boot: Arc<dyn BootSession> = Arc::new(WindowsBootSession::new(!options.development)?);
         let system_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());

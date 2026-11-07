@@ -94,6 +94,11 @@ pub trait SecurityCopier: Send + Sync {
     fn copy_root(&self, from: &Path, to: &Path) -> std::io::Result<()> {
         self.copy(from, to)
     }
+    /// Nomes dos fluxos alternativos de dados de um item (sem o fluxo principal). Implementação
+    /// real: NTFS; padrão: nenhum (testes e plataformas sem fluxos).
+    fn streams(&self, _: &Path) -> std::io::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
 }
 
 /// Sem cópia de segurança (testes e modo simulado sem privilégio).
