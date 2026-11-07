@@ -236,7 +236,10 @@ continua sem guardar senhas de volume.
   que outro processo crie o pipe antes), `PIPE_REJECT_REMOTE_CLIENTS` e ACL por SDDL: SYSTEM e
   Administradores controle total; usuários interativos só `0x120183` (ler/gravar dados e atributos, ler o
   descritor, sincronizar), **sem `FILE_CREATE_PIPE_INSTANCE`**: em pipes, `GENERIC_WRITE` incluiria esse
-  direito e permitiria criar instâncias falsas do servidor; `NETWORK` negado; no máximo 8 conexões.
+  direito e permitiria criar instâncias falsas do servidor; `NETWORK` negado; no máximo 8 conexões,
+  no máximo 4 por usuário do Windows (identificado pelo processo cliente logo ao conectar, antes de ler
+  dados). E/S overlapped: cada mensagem (cabeçalho e corpo) precisa chegar em 10 s e cada resposta ser
+  entregue em 10 s; vencido o prazo, a operação é cancelada e a conexão fechada.
 - O serviço define o **dono** do pipe explicitamente como SYSTEM (com token elevado o dono padrão
   seria Administradores, e qualquer processo elevado poderia criar um pipe com esse dono). O cliente
   aceita somente dono SYSTEM antes de enviar qualquer dado (defesa contra *pipe squatting*).

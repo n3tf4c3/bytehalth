@@ -11,18 +11,23 @@ use bytehalt_ipc::{ErrorCode, Request, Response, parse_request, read_frame, writ
 use std::fs::File;
 use std::os::windows::io::{FromRawHandle, RawHandle};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Security::Authorization::*;
 use windows_sys::Win32::Security::*;
 use windows_sys::Win32::Storage::FileSystem::*;
+use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Pipes::*;
-use windows_sys::Win32::System::Threading::{OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION};
+use windows_sys::Win32::System::Threading::{CreateEventW, INFINITE, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject};
 
 pub const SYSTEM_SID: &str = "S-1-5-18";
 const BUFFER: u32 = 64 * 1024;
 pub const MAX_CONNECTIONS: usize = 8;
+/// Conexões simultâneas de um mesmo usuário do Windows: um usuário sozinho não ocupa todas.
+pub const MAX_PER_CALLER: usize = 4;
+/// Prazo para receber uma mensagem inteira (cabeçalho e corpo) e para entregar a resposta.
+pub const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Direitos dos usuários interativos: FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES |
 /// FILE_WRITE_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE. Sem FILE_CREATE_PIPE_INSTANCE (0x4).
@@ -109,7 +114,8 @@ fn pipe_path(name: &str) -> Vec<u16> {
 pub fn create_instance(name: &str, sd: &SecurityDescriptor, first: bool) -> anyhow::Result<File> {
     let path = pipe_path(name);
     let sa = SECURITY_ATTRIBUTES { nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: sd.0, bInheritHandle: 0 };
-    let open_mode = PIPE_ACCESS_DUPLEX | if first { FILE_FLAG_FIRST_PIPE_INSTANCE } else { 0 };
+    // Overlapped: leitura e escrita com prazo e cancelamento (uma conexão parada não prende o servidor).
+    let open_mode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | if first { FILE_FLAG_FIRST_PIPE_INSTANCE } else { 0 };
     // SAFETY: caminho terminado em nulo; atributos apontam para descritor vivo durante a chamada.
     let h = unsafe {
         CreateNamedPipeW(
@@ -132,12 +138,163 @@ fn raw(f: &File) -> HANDLE {
     std::os::windows::io::AsRawHandle::as_raw_handle(f) as HANDLE
 }
 
+/// Evento manual de uma operação overlapped (fechado no Drop).
+struct Event(HANDLE);
+
+impl Event {
+    fn new() -> std::io::Result<Self> {
+        // SAFETY: evento anônimo, reinicialização manual, não sinalizado.
+        let h = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if h.is_null() { Err(std::io::Error::last_os_error()) } else { Ok(Self(h)) }
+    }
+}
+
+impl Drop for Event {
+    fn drop(&mut self) {
+        // SAFETY: handle próprio.
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+/// Executa uma operação overlapped e espera até `deadline` (`None` = sem prazo). Vencido o prazo, a
+/// operação é cancelada e o resultado é `TimedOut`. `start` recebe o OVERLAPPED e devolve o BOOL da API.
+fn overlapped(pipe: &File, deadline: Option<std::time::Instant>, start: impl FnOnce(*mut OVERLAPPED) -> windows_sys::core::BOOL) -> std::io::Result<u32> {
+    let event = Event::new()?;
+    // SAFETY: estrutura C sem invariantes; zerada é válida.
+    let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
+    ov.hEvent = event.0;
+    if start(&mut ov) == 0 {
+        let e = last_error();
+        if e != ERROR_IO_PENDING {
+            return Err(std::io::Error::from_raw_os_error(e as i32));
+        }
+        let wait = deadline.map_or(INFINITE, |d| d.saturating_duration_since(std::time::Instant::now()).as_millis().min(u128::from(INFINITE - 1)) as u32);
+        // SAFETY: evento válido.
+        if unsafe { WaitForSingleObject(event.0, wait) } != WAIT_OBJECT_0 {
+            // SAFETY: cancela só esta operação; o resultado é colhido abaixo antes de liberar `ov`.
+            unsafe { CancelIoEx(raw(pipe), &ov) };
+        }
+    }
+    let mut n = 0u32;
+    // SAFETY: `ov` vivo até a operação terminar (bWait = TRUE).
+    if unsafe { GetOverlappedResult(raw(pipe), &ov, &mut n, 1) } == 0 {
+        let e = last_error();
+        return Err(if e == ERROR_OPERATION_ABORTED {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "prazo da conexão esgotado")
+        } else {
+            std::io::Error::from_raw_os_error(e as i32)
+        });
+    }
+    Ok(n)
+}
+
 /// Espera um cliente. Retorna erro se a conexão falhar.
 pub fn accept(pipe: &File) -> anyhow::Result<()> {
-    // SAFETY: handle de servidor válido; operação síncrona.
-    let ok = unsafe { ConnectNamedPipe(raw(pipe), std::ptr::null_mut()) };
-    anyhow::ensure!(ok != 0 || last_error() == ERROR_PIPE_CONNECTED, "Falha ao aceitar conexão ({}).", last_error());
+    accept_until(pipe, &AtomicBool::new(false))
+}
+
+/// Espera um cliente em fatias de 250 ms; com `stop` ligado, cancela a espera e devolve erro. O
+/// encerramento do servidor não depende de uma conexão chegar.
+fn accept_until(pipe: &File, stop: &AtomicBool) -> anyhow::Result<()> {
+    let event = Event::new()?;
+    // SAFETY: estrutura C sem invariantes; zerada é válida.
+    let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
+    ov.hEvent = event.0;
+    // SAFETY: handle de servidor overlapped válido; `ov` vivo até o resultado ser colhido.
+    if unsafe { ConnectNamedPipe(raw(pipe), &mut ov) } == 0 {
+        match last_error() {
+            ERROR_PIPE_CONNECTED => return Ok(()),
+            ERROR_IO_PENDING => loop {
+                // SAFETY: evento válido.
+                if unsafe { WaitForSingleObject(event.0, 250) } == WAIT_OBJECT_0 {
+                    break;
+                }
+                if stop.load(Ordering::SeqCst) {
+                    let mut n = 0u32;
+                    // SAFETY: cancela esta espera e colhe o resultado antes de liberar `ov`.
+                    unsafe {
+                        CancelIoEx(raw(pipe), &ov);
+                        GetOverlappedResult(raw(pipe), &ov, &mut n, 1);
+                    }
+                    anyhow::bail!("Servidor encerrado.");
+                }
+            },
+            e => anyhow::bail!("Falha ao aceitar conexão ({e})."),
+        }
+    }
+    let mut n = 0u32;
+    // SAFETY: operação concluída (evento sinalizado); `ov` vivo.
+    anyhow::ensure!(unsafe { GetOverlappedResult(raw(pipe), &ov, &mut n, 0) } != 0, "Falha ao aceitar conexão ({}).", last_error());
     Ok(())
+}
+
+/// Leitura e escrita da conexão com prazo único para a mensagem em curso.
+struct Timed<'a> {
+    pipe: &'a File,
+    deadline: std::time::Instant,
+}
+
+impl Timed<'_> {
+    fn new(pipe: &File) -> Timed<'_> {
+        Timed { pipe, deadline: std::time::Instant::now() + FRAME_TIMEOUT }
+    }
+}
+
+impl std::io::Read for Timed<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let len = buf.len().min(u32::MAX as usize) as u32;
+        let ptr = buf.as_mut_ptr();
+        overlapped(self.pipe, Some(self.deadline), |ov| {
+            // SAFETY: buffer vivo e exclusivo até a operação terminar (overlapped espera o resultado).
+            unsafe { ReadFile(raw(self.pipe), ptr, len, std::ptr::null_mut(), ov) }
+        })
+        .map(|n| n as usize)
+    }
+}
+
+impl std::io::Write for Timed<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let len = buf.len().min(u32::MAX as usize) as u32;
+        let ptr = buf.as_ptr();
+        overlapped(self.pipe, Some(self.deadline), |ov| {
+            // SAFETY: buffer vivo até a operação terminar (overlapped espera o resultado).
+            unsafe { WriteFile(raw(self.pipe), ptr, len, std::ptr::null_mut(), ov) }
+        })
+        .map(|n| n as usize)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Vagas por usuário e no total. A identidade vem do processo cliente, logo ao conectar.
+#[derive(Default)]
+struct Slots {
+    by_caller: std::collections::HashMap<String, usize>,
+    total: usize,
+}
+
+impl Slots {
+    fn admit(&mut self, sid: &str) -> bool {
+        let mine = self.by_caller.get(sid).copied().unwrap_or(0);
+        if self.total >= MAX_CONNECTIONS || mine >= MAX_PER_CALLER {
+            return false;
+        }
+        self.total += 1;
+        *self.by_caller.entry(sid.to_owned()).or_insert(0) += 1;
+        true
+    }
+
+    fn release(&mut self, sid: &str) {
+        self.total = self.total.saturating_sub(1);
+        if let Some(n) = self.by_caller.get_mut(sid) {
+            *n -= 1;
+            if *n == 0 {
+                self.by_caller.remove(sid);
+            }
+        }
+    }
 }
 
 /// Conecta como cliente (nível de impersonation Identification) e verifica o dono do pipe ANTES de
@@ -262,7 +419,7 @@ impl Server {
         let first = create_instance(name, &sd, true)?;
         let stop = Arc::new(AtomicBool::new(false));
         let (n, s) = (name.to_owned(), stop.clone());
-        let active = Arc::new(AtomicUsize::new(0));
+        let slots = Arc::new(std::sync::Mutex::new(Slots::default()));
         let acceptor = std::thread::Builder::new().name("bytehalt-pipe".into()).spawn(move || {
             let mut next = Some(first);
             while !s.load(Ordering::SeqCst) {
@@ -277,17 +434,27 @@ impl Server {
                         }
                     },
                 };
-                if accept(&pipe).is_err() || s.load(Ordering::SeqCst) {
+                if accept_until(&pipe, &s).is_err() || s.load(Ordering::SeqCst) {
                     continue;
                 }
-                if active.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
-                    continue; // conexão excedente é fechada ao descartar `pipe`
+                // A próxima instância já fica ouvindo antes de identificar este cliente: um cliente que
+                // chega agora não encontra o pipe ausente (erro 2).
+                match create_instance(&n, &sd, false) {
+                    Ok(p) => next = Some(p),
+                    Err(e) => eprintln!("{e:#}"),
                 }
-                active.fetch_add(1, Ordering::SeqCst);
-                let (h, a) = (handler.clone(), active.clone());
+                // Identifica antes de ler qualquer dado: sem identidade ou sem vaga, a conexão é fechada.
+                let Some(who) = caller(&pipe) else { continue };
+                if !slots.lock().unwrap_or_else(|e| e.into_inner()).admit(&who.sid) {
+                    // SAFETY: handle de servidor próprio; a conexão excedente é encerrada.
+                    unsafe { DisconnectNamedPipe(raw(&pipe)) };
+                    continue;
+                }
+                let (h, sl) = (handler.clone(), slots.clone());
                 let _ = std::thread::Builder::new().name("bytehalt-conn".into()).spawn(move || {
-                    serve_connection(pipe, h.as_ref());
-                    a.fetch_sub(1, Ordering::SeqCst);
+                    let sid = who.sid.clone();
+                    serve_connection(pipe, who, h.as_ref());
+                    sl.lock().unwrap_or_else(|e| e.into_inner()).release(&sid);
                 });
             }
         })?;
@@ -325,14 +492,10 @@ impl Drop for Server {
     }
 }
 
-fn serve_connection(mut pipe: File, handler: &(dyn Fn(Request, &Caller) -> Response + Send + Sync)) {
-    let mut who: Option<Caller> = None;
-    // Fim, truncado ou acima do limite: encerra sem processar.
-    while let Ok(Some(bytes)) = read_frame(&mut pipe) {
-        if who.is_none() {
-            who = caller(&pipe);
-        }
-        let Some(c) = &who else { break };
+fn serve_connection(pipe: File, who: Caller, handler: &(dyn Fn(Request, &Caller) -> Response + Send + Sync)) {
+    let c = &who;
+    // Fim, truncado, acima do limite ou fora do prazo: encerra sem processar.
+    while let Ok(Some(bytes)) = read_frame(&mut Timed::new(&pipe)) {
         let response = match parse_request(&bytes) {
             Ok(request) => {
                 let id = request.id;
@@ -345,7 +508,7 @@ fn serve_connection(mut pipe: File, handler: &(dyn Fn(Request, &Caller) -> Respo
             Err(r) => r,
         };
         let Ok(out) = serde_json::to_vec(&response) else { break };
-        if write_frame(&mut pipe, &out).is_err() {
+        if write_frame(&mut Timed::new(&pipe), &out).is_err() {
             break;
         }
     }
@@ -435,5 +598,47 @@ mod tests {
         let se = e.downcast_ref::<bytehalt_ipc::ServiceError>().unwrap();
         assert_eq!(se.code, ErrorCode::Internal);
         assert!(!se.message.contains("secreto"));
+    }
+
+    // Achado de auditoria #11 (CONTROLE): só API pública, vale também contra a versão anterior.
+    #[test]
+    fn conexoes_paradas_nao_ocupam_o_servico_indefinidamente() {
+        use std::io::Read;
+        let n = name();
+        let _s = Server::start(&n, SecurityDescriptor::from_sddl(&development_sddl(&me())).unwrap(), echo()).unwrap();
+        // Oito conexões que nunca completam uma mensagem: metade sem nada, metade com meio cabeçalho.
+        let mut stalled = Vec::new();
+        for i in 0..8 {
+            let mut c = connect(&n, &[me()], Duration::from_secs(5)).unwrap();
+            if i % 2 == 1 {
+                c.write_all(&[1, 0]).unwrap();
+            }
+            stalled.push(c);
+        }
+        std::thread::sleep(Duration::from_secs(13));
+        let mut c = connect(&n, &[me()], Duration::from_secs(5)).unwrap();
+        assert!(call(&mut c, Command::Ping).is_ok(), "conexões paradas continuam ocupando o serviço");
+        // O servidor encerrou as conexões paradas (fim de fluxo ou erro ao ler do lado do cliente).
+        for mut s in stalled {
+            let mut b = [0u8; 1];
+            assert!(matches!(s.read(&mut b), Ok(0) | Err(_)), "conexão parada continuou aberta");
+        }
+    }
+    // FIM CONTROLE
+
+    #[test]
+    fn vagas_limitadas_por_usuario_e_no_total() {
+        let mut s = Slots::default();
+        for _ in 0..MAX_PER_CALLER {
+            assert!(s.admit("S-1-5-21-1"));
+        }
+        assert!(!s.admit("S-1-5-21-1"), "um usuário passou da cota");
+        for _ in 0..MAX_CONNECTIONS - MAX_PER_CALLER {
+            assert!(s.admit("S-1-5-21-2"));
+        }
+        assert!(!s.admit("S-1-5-21-3"), "passou do total");
+        s.release("S-1-5-21-1");
+        assert!(s.admit("S-1-5-21-3"), "a vaga liberada volta a valer");
+        assert!(!s.admit("S-1-5-21-1"));
     }
 }
