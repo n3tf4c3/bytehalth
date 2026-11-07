@@ -757,6 +757,7 @@ dependencies = [
  "bytehalt-core",
  "bytehalt-windows",
  "embed-resource",
+ "rusqlite",
  "tempfile",
  "uuid",
  "windows 0.62.2",

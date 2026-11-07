@@ -58,3 +58,91 @@ fn pasta_de_instalacao_que_e_juncao_perde_so_o_link() {
     assert!(std::fs::symlink_metadata(&install).is_err(), "o link continuou");
     assert_eq!(std::fs::read(outside.join("segredo.txt")).unwrap(), b"de fora");
 }
+
+// --- Achado de auditoria #10: cofres conferidos de novo depois de parar o serviço. ---
+
+fn vault(name: &str) -> bytehalt_core::vault::VaultRecord {
+    bytehalt_core::vault::VaultRecord {
+        id: uuid::Uuid::new_v4(),
+        name: name.into(),
+        original_path: r"D:\Projetos\x".into(),
+        reserve_path: None,
+        store_path: r"D:\ByteHalt.Cofres\a.vhdx".into(),
+        volume: None,
+        max_bytes: 0,
+        stage: bytehalt_core::vault::VaultStage::Preparing,
+        files: 0,
+        bytes: 0,
+        created_at: 0,
+        resource_id: None,
+        error: None,
+        restore_path: None,
+    }
+}
+
+fn db(data: &Path) -> bytehalt_windows::sqlite::SqliteStore {
+    bytehalt_windows::sqlite::SqliteStore::open(&data.join("bytehalt.db")).unwrap()
+}
+
+#[test]
+fn cofre_criado_antes_da_parada_do_servico_recusa_e_religa_o_servico() {
+    use bytehalt_core::vault::VaultRepository;
+    let t = tempfile::tempdir().unwrap();
+    drop(db(t.path()));
+    assert!(vault_refusal(t.path()).unwrap().is_none(), "primeira consulta: sem cofres");
+    let started = std::cell::Cell::new(false);
+    // Uma preparação autorizada grava o cofre entre a primeira consulta e a parada do serviço.
+    let r = stop_and_recheck(
+        t.path(),
+        || {
+            db(t.path()).upsert_vault(&vault("Tardio")).unwrap();
+            Ok(())
+        },
+        || {
+            started.set(true);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(r.is_some_and(|m| m.contains("Tardio")), "desinstalação seguiria com um cofre criado na janela");
+    assert!(started.get(), "o serviço precisa voltar a rodar quando a desinstalação é recusada");
+}
+
+#[test]
+fn sem_cofres_depois_da_parada_o_servico_fica_parado() {
+    let t = tempfile::tempdir().unwrap();
+    drop(db(t.path()));
+    let started = std::cell::Cell::new(false);
+    let r = stop_and_recheck(
+        t.path(),
+        || Ok(()),
+        || {
+            started.set(true);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(r.is_none());
+    assert!(!started.get());
+}
+
+#[test]
+fn cofres_ilegiveis_depois_da_parada_recusam_e_religam_o_servico() {
+    let t = tempfile::tempdir().unwrap();
+    drop(db(t.path()));
+    rusqlite::Connection::open(t.path().join("bytehalt.db"))
+        .unwrap()
+        .execute("INSERT INTO vaults (id, data) VALUES (?1, '{corrompido')", [uuid::Uuid::new_v4().to_string()])
+        .unwrap();
+    let started = std::cell::Cell::new(false);
+    let r = stop_and_recheck(
+        t.path(),
+        || Ok(()),
+        || {
+            started.set(true);
+            Ok(())
+        },
+    );
+    assert!(r.is_err(), "leitura ilegível não pode liberar a desinstalação");
+    assert!(started.get());
+}

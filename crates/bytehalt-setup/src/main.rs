@@ -361,14 +361,37 @@ fn create_shortcut(lnk: &Path, target: &Path) -> anyhow::Result<()> {
 
 // ---------------- Desinstalação ----------------
 
+/// Motivo para recusar a desinstalação pelos cofres cadastrados (nenhum se não houver banco).
+fn vault_refusal(data: &Path) -> anyhow::Result<Option<String>> {
+    let db = data.join("bytehalt.db");
+    if !db.exists() {
+        return Ok(None);
+    }
+    let vaults = bytehalt_windows::sqlite::SqliteStore::open(&db).and_then(|s| s.vaults()).map_err(|e| anyhow::anyhow!("Ler os cofres: {e:#}"))?;
+    Ok(plan::refuse_reason(&vaults))
+}
+
+/// Para o serviço e confere os cofres de novo: entre a primeira consulta e a parada, um cliente já
+/// autorizado pode ter iniciado a preparação de um cofre. Com o serviço parado nada mais cria cofres.
+/// Se houver cofre (ou a leitura falhar), o serviço volta a rodar e a desinstalação é recusada.
+fn stop_and_recheck(data: &Path, stop: impl FnOnce() -> anyhow::Result<()>, start: impl FnOnce() -> anyhow::Result<()>) -> anyhow::Result<Option<String>> {
+    stop()?;
+    let refusal = match vault_refusal(data) {
+        Ok(None) => return Ok(None),
+        Ok(Some(reason)) => Ok(Some(reason)),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = start() {
+        let extra = format!("\n\nO serviço não voltou a iniciar ({e:#}); inicie-o pelo Windows (Serviços) ou reinicie o computador.");
+        return refusal.map(|r| r.map(|r| r + &extra)).map_err(|e2| anyhow::anyhow!("{e2:#}{extra}"));
+    }
+    refusal
+}
+
 fn uninstall(cx: &mut Ctx, purge: bool) -> anyhow::Result<(i32, String)> {
     let data = data_dir();
-    let db = data.join("bytehalt.db");
-    if db.exists() {
-        let vaults = bytehalt_windows::sqlite::SqliteStore::open(&db).and_then(|s| s.vaults()).map_err(|e| anyhow::anyhow!("Ler os cofres: {e:#}"))?;
-        if let Some(reason) = plan::refuse_reason(&vaults) {
-            return Ok((exit::REFUSED, format!("Desinstalação recusada.\n\n{reason}")));
-        }
+    if let Some(reason) = vault_refusal(&data)? {
+        return Ok((exit::REFUSED, format!("Desinstalação recusada.\n\n{reason}")));
     }
     if cx.ask(
         "Desinstalar o ByteHalt?\n\nUnidades BitLocker não são alteradas: as bloqueadas continuam bloqueadas (desbloqueie pelo Windows).",
@@ -384,7 +407,12 @@ fn uninstall(cx: &mut Ctx, purge: bool) -> anyhow::Result<(i32, String)> {
                 MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
             ) == IDYES);
     close_ui(cx);
-    stop_service(cx)?;
+    let installed = manager()?.open_service(SERVICE, ACCESS).is_ok();
+    let cell = std::cell::RefCell::new(&mut *cx);
+    let refusal = stop_and_recheck(&data, || stop_service(&mut cell.borrow_mut()), || if installed { start_service(&mut cell.borrow_mut()) } else { Ok(()) })?;
+    if let Some(reason) = refusal {
+        return Ok((exit::REFUSED, format!("Desinstalação recusada.\n\n{reason}")));
+    }
     if let Ok(s) = manager()?.open_service(SERVICE, ACCESS) {
         s.delete().map_err(|e| anyhow::anyhow!("Remover o serviço: {e}"))?;
         drop(s);
