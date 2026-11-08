@@ -406,7 +406,8 @@ fn paint(entity: &Entity<TextInput>, bounds: Bounds<Pixels>, window: &mut Window
     let focus = input.focus.clone();
     let style = window.text_style();
     let (text, color): (SharedString, _) = if input.content.is_empty() {
-        (input.placeholder.clone(), t.text_faint)
+        // text_muted: contraste de 4,5:1 ou mais sobre o fundo do campo nos dois temas (text_faint ficava abaixo).
+        (input.placeholder.clone(), t.text_muted)
     } else if input.masked {
         (MASK.to_string().repeat(input.content.chars().count()).into(), t.text)
     } else {

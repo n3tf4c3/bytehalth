@@ -206,8 +206,13 @@ impl Workspace {
     }
 
     pub fn end_auth_session(&mut self, cx: &mut Context<Self>) {
-        self.send(Command::EndAuthSession, cx, |ws, _, cx| {
-            ws.account.message = Some(("Sessão encerrada: alterações voltam a pedir a senha mestra.".into(), Tone::Neutral));
+        self.send(Command::EndAuthSession, cx, |ws, r, cx| {
+            // Só confirma depois da resposta do serviço; falha não vira "sessão encerrada".
+            ws.account.message = Some(match r {
+                Ok(Reply::Ack) => ("Sessão encerrada: alterações voltam a pedir a senha mestra.".into(), Tone::Neutral),
+                Ok(_) => ("Resposta inesperada do serviço: o encerramento da sessão não foi confirmado.".into(), Tone::Danger),
+                Err(f) => (format!("A sessão não foi encerrada: {} Tente de novo.", f.text()), Tone::Danger),
+            });
             ws.refresh_auth(cx);
         });
     }

@@ -405,6 +405,8 @@ impl MasterAuth {
         }
         self.invalidate_pending();
         self.succeeded();
+        // Senha nova: sessões abertas com a anterior (de qualquer usuário) deixam de valer.
+        self.inner().sessions.clear();
         self.open_session(sid);
         self.log(EventType::ConfigurationChanged, Severity::Info, "Senha mestra e autenticador cadastrados.");
         Ok(codes)
@@ -430,6 +432,8 @@ impl MasterAuth {
         self.save(&c)?;
         self.invalidate_pending();
         self.succeeded();
+        // Senha nova: sessões abertas com a anterior (de qualquer usuário) deixam de valer.
+        self.inner().sessions.clear();
         self.open_session(sid);
         self.log(EventType::ConfigurationChanged, Severity::Info, "Senha mestra alterada.");
         Ok(())
@@ -480,6 +484,8 @@ impl MasterAuth {
         self.save(&c)?;
         self.invalidate_pending();
         self.succeeded();
+        // Senha nova: sessões abertas com a anterior (de qualquer usuário) deixam de valer.
+        self.inner().sessions.clear();
         self.open_session(sid);
         self.log(EventType::ConfigurationChanged, Severity::Warning, "Senha mestra redefinida com código de recuperação.");
         Ok(c.recovery.len())
@@ -685,6 +691,21 @@ mod tests {
         assert!(!a.verify(&code_now(&a, &old)), "o autenticador antigo deixou de valer");
         assert!(a.verify(&code_now(&a, &new)));
         assert_eq!(a.status("S-1").recovery_left, 9);
+    }
+
+    // Achado de auditoria #17: senha nova encerra as sessões abertas com a anterior.
+    #[test]
+    fn trocar_ou_redefinir_a_senha_encerra_as_sessoes_dos_outros() {
+        let (a, clock, _) = auth();
+        let (_, codes) = setup(&a, &clock);
+        a.authenticate("S-2", "correta-cavalo-bateria").unwrap();
+        assert!(a.has_session("S-2"));
+        a.change_password("S-1", "correta-cavalo-bateria", "nova-senha-mestra-9").unwrap();
+        assert!(!a.has_session("S-2"), "sessão aberta com a senha antiga continuou valendo");
+        assert!(a.has_session("S-1"), "quem trocou continua com a sessão");
+        a.authenticate("S-2", "nova-senha-mestra-9").unwrap();
+        a.reset_password("S-1", &codes[0], "outra-senha-mestra-7").unwrap();
+        assert!(!a.has_session("S-2"), "a redefinição não encerrou a sessão do outro usuário");
     }
 }
 

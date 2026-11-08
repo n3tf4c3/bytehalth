@@ -160,9 +160,13 @@ Limitações a documentar ao usuário:
 - Indexador, antivírus e backup geram I/O. A Fase 4 deve permitir excluir processos de sistema
   conhecidos (`SearchProtocolHost`, `MsMpEng`) do sinal de atividade, quando a fonte for Kernel-File.
 - **Ociosidade da sessão:** o serviço roda na sessão 0 e não lê `GetLastInputInfo` da sessão do
-  usuário. A interface (na sessão do usuário) informa o tempo de ociosidade por IPC. Um processo do
-  usuário poderia mentir, mas só para **adiar** o bloqueio do próprio usuário; bloqueio da estação
-  (`SessionLock`) vem direto do SCM e é confiável.
+  usuário. A interface (na sessão do usuário) informa o tempo de ociosidade por IPC. O relato é aceito
+  só do dono da configuração ou de um administrador (o valor vale para todos os grupos); o de outros
+  usuários é recusado. Quem pode relatar poderia mentir para **adiar** o bloqueio, mas já controla a
+  política; bloqueio da estação (`SessionLock`) vem direto do SCM e é confiável.
+- **Histórico pelo pipe:** a resposta traz os eventos mais recentes que cabem no limite de 64 KiB;
+  os mais antigos são cortados. Se a consulta falhar, a interface mantém a última lista e avisa que
+  ela pode estar desatualizada.
 
 Na Fase 1 a fonte de atividade é **simulada** (`SimulatedActivitySource`) e a interface é
 `IActivitySource`. Os modos de política são:
@@ -182,6 +186,7 @@ Na Fase 1 a fonte de atividade é **simulada** (`SimulatedActivitySource`) e a i
 | Autenticador | RFC 6238 (HMAC-SHA1, 6 dígitos, 30 s, ±1 passo; crates `hmac`/`sha1`, comparação em tempo constante com `subtle`). Segredo de 160 bits do gerador do sistema, QR code `otpauth://` (crate `qrcode`). O cadastro só é gravado depois do primeiro código válido. Código aceito não vale de novo. |
 | Códigos de recuperação | 10 códigos `XXXXX-XXXXX` (50 bits), mostrados uma vez, guardados só como hash Argon2id, uso único. Redefinem a senha mestra ou, junto com ela, recadastram o autenticador. |
 | Recadastrar o autenticador | Senha mestra **mais** código atual do aplicativo ou de recuperação (só a senha anularia o segundo fator). |
+| Troca ou redefinição da senha mestra | Encerra as sessões de configuração abertas com a senha anterior (de qualquer usuário) e reabre só a de quem fez a troca. |
 | Regenerar códigos de recuperação | Senha mestra **mais** TOTP atual ainda não usado ou código de recuperação anterior. A prova é consumida junto da gravação dos novos códigos; os anteriores deixam de valer. |
 | Tentativas | 5 erros de senha ou código de recuperação ⇒ espera de 30 s, dobrando até 15 min. |
 | Armazenamento | Um arquivo `state\credentials.dat`, DPAPI de máquina com entropia própria (`ByteHalt.Credentials.v1`). Ilegível ⇒ erro (falha fechada): nunca vira "sem senha" nem permite cadastrar outra por cima. |

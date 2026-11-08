@@ -377,6 +377,12 @@ impl VaultManager {
         if !original.is_dir() {
             return Err(one("A pasta original não existe mais."));
         }
+        // Criado depois da preparação, um item com nome reservado ficaria só na reserva sem aviso.
+        if migrate::has_reserved_root_names(&original).map_err(|e| one(format!("Ler a pasta original: {e}")))? {
+            return Err(one(
+                "A pasta contém \"System Volume Information\" ou \"$RECYCLE.BIN\" na raiz, nomes reservados que não seriam copiados. Renomeie ou mova antes da troca.",
+            ));
+        }
         self.platform.attach(Path::new(&v.store_path)).map_err(|e| one(format!("Anexar o disco: {e:#}")))?;
         match self.platform.holders(&original) {
             Ok(h) if !h.is_empty() => {

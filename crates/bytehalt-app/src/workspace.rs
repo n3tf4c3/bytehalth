@@ -88,6 +88,8 @@ pub struct Workspace {
     pub connection: String,
     pub snapshot: Option<Snapshot>,
     pub history: Vec<JournalEntry>,
+    /// A última consulta do histórico falhou: a lista mostrada pode estar desatualizada.
+    pub history_stale: bool,
     pub notified_until: Option<UtcMillis>,
     pub status: Option<String>,
     pub volumes: Vec<VolumeInfo>,
@@ -137,6 +139,7 @@ impl Workspace {
             connection: "Conectando ao serviço…".into(),
             snapshot: None,
             history: Vec::new(),
+            history_stale: false,
             notified_until: None,
             status: None,
             volumes: Vec::new(),
@@ -224,7 +227,10 @@ impl Workspace {
                 ws.send(Command::GetHistory { limit: 200 }, cx, |ws, r, _| {
                     if let Ok(Reply::History(h)) = r {
                         ws.history = h;
+                        ws.history_stale = false;
                         ws.notify_new();
+                    } else {
+                        ws.history_stale = true;
                     }
                 });
             }
@@ -1156,7 +1162,15 @@ impl Workspace {
                     .child(
                         div()
                             .child(ui::title("Histórico", &t))
-                            .child(ui::muted("Bloqueios, desbloqueios, erros e alertas. Nenhuma senha ou código é registrado.", &t)),
+                            .child(ui::muted("Bloqueios, desbloqueios, erros e alertas. Nenhuma senha ou código é registrado.", &t))
+                            .when(self.history_stale, |d| {
+                                d.child(
+                                    div()
+                                        .text_size(px(12.5))
+                                        .text_color(t.warning)
+                                        .child("Não foi possível atualizar o histórico; mostrando a última lista recebida. Nova tentativa automática."),
+                                )
+                            }),
                     )
                     .child(ui::checkbox("only-problems", "Somente avisos e erros", self.only_problems, cx).on_click(cx.listener(|ws, _, _, cx| {
                         ws.only_problems = !ws.only_problems;

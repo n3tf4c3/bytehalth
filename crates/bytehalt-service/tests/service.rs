@@ -573,3 +573,27 @@ fn cofre_ilegivel_no_banco_nao_remove_protecoes_na_partida() {
         "a falha de leitura dos cofres não ficou registrada"
     );
 }
+
+/// Achado de auditoria #6: a ociosidade relatada move os temporizadores de todos; só dono ou admin.
+#[test]
+fn relato_de_ociosidade_so_do_dono_ou_administrador() {
+    let idle = Command::ReportSessionIdle { idle_secs: 0 };
+    assert!(!authorized(&idle, &caller("S-1-5-21-200", false), Some("S-1-5-21-100"), false), "outro usuário adiou o bloqueio de todos");
+    assert!(authorized(&idle, &caller("S-1-5-21-100", false), Some("S-1-5-21-100"), false));
+    assert!(authorized(&idle, &caller("S-1-5-21-300", true), Some("S-1-5-21-100"), false));
+    assert!(authorized(&idle, &caller("S-1-5-21-200", false), None, false), "antes de haver dono");
+}
+
+/// Achado de auditoria #12: histórico válido maior que o limite do pipe não pode derrubar a resposta.
+#[test]
+fn historico_grande_cabe_na_resposta_do_pipe() {
+    let s = Svc::start();
+    let host = s.host.clone().unwrap();
+    let long = "ç𝄞".repeat(150);
+    for i in 0..200 {
+        host.journal(EventType::ConfigurationChanged, &format!("{i} {long}"));
+    }
+    let Reply::History(h) = s.call(Command::GetHistory { limit: 200 }).expect("histórico grande derrubou a resposta") else { panic!() };
+    assert!(!h.is_empty() && h.len() < 200, "{} eventos", h.len());
+    assert!(h[0].message.starts_with("199 "), "os mais recentes vêm primeiro");
+}

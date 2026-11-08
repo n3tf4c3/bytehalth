@@ -484,3 +484,16 @@ fn lista_de_cofres_ilegivel_impede_analisar_e_preparar() {
     assert!(m.prepare(INITIATOR, "Cliente", &path(&w.data), PASS.into(), 2 << 30).is_err(), "preparação aceita sem conseguir ler os cofres");
     assert!(!w.fake.store.exists(), "nenhum disco pode ser criado");
 }
+
+/// Achado de auditoria #7: item com nome reservado criado depois da preparação ficaria só na reserva.
+#[test]
+fn nome_reservado_criado_depois_da_preparacao_impede_a_troca() {
+    let w = world();
+    let v = prepare(&w);
+    assert_eq!(v.stage, VaultStage::Ready);
+    fs::create_dir_all(w.data.join("$RECYCLE.BIN")).unwrap();
+    fs::write(w.data.join("$RECYCLE.BIN").join("x.txt"), b"x").unwrap();
+    assert!(w.m.swap(v.id).is_err(), "troca aceita com nome reservado na raiz");
+    assert_eq!(w.m.vault(v.id).unwrap().stage, VaultStage::Ready);
+    assert!(w.data.join("$RECYCLE.BIN").join("x.txt").exists());
+}

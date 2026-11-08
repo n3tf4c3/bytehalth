@@ -154,14 +154,16 @@ pub fn evaluate(
     {
         return Requirement::totp(Reason::ClockRollbackDetected, None);
     }
-    let elapsed = Duration::from_millis(wall_elapsed_ms.max(0) as u64);
+    let mut elapsed = Duration::from_millis(wall_elapsed_ms.max(0) as u64);
     if r.boot_id == boot_id {
         let at_lock = Duration::from_millis(r.uptime_at_lock_ms);
         match uptime.checked_sub(at_lock) {
             // O relógio de parede andou menos que o tempo real: alguém o atrasou.
             Some(mono) if mono > elapsed + CLOCK_TOLERANCE => return Requirement::totp(Reason::ClockMismatchDetected, Some(mono)),
             None => return Requirement::totp(Reason::ClockMismatchDetected, None),
-            _ => {}
+            // Dentro da tolerância, o limiar usa o maior dos dois: atrasar o relógio de parede
+            // alguns minutos não adia a exigência do autenticador.
+            Some(mono) => elapsed = elapsed.max(mono),
         }
     }
     if elapsed >= threshold {
@@ -427,5 +429,13 @@ mod tests {
     fn limiar_configuravel() {
         let r = evaluate(&rec("boot-A"), &StoreRead::NotFound, LOCKED + 2 * 3_600_000, "boot-B", Duration::ZERO, Duration::from_secs(3600));
         assert!(r.requires_totp());
+    }
+
+    // Achado de auditoria #13: dentro da tolerância, o limiar usa o maior entre parede e monotônico.
+    #[test]
+    fn limiar_usa_o_maior_entre_parede_e_monotonico() {
+        // Mesmo boot: relógio de parede marca 23h58, tempo real (monotônico) 24h01; diferença de 3 min.
+        let r = after(23 * 60 + 58, "boot-A", Some(24 * 60 + 1), StoreRead::NotFound);
+        assert_eq!(r.factors, Factors::PrimaryAndTotp, "atraso de 3 min no relógio adiou o TOTP: {:?}", r.reason);
     }
 }

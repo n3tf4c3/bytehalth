@@ -213,7 +213,7 @@ impl Host {
         Ok(match command {
             Command::Ping => Reply::Pong { version: VERSION.into(), simulated: e.simulated() },
             Command::GetSnapshot => Reply::Snapshot(e.snapshot()),
-            Command::GetHistory { limit } => Reply::History(self.config.as_ref().recent_entries(limit as usize).map_err(internal)?),
+            Command::GetHistory { limit } => Reply::History(fit_history(self.config.as_ref().recent_entries(limit as usize).map_err(internal)?)),
             Command::SaveResource { mut resource } => {
                 if resource.kind == ResourceKind::BitLockerVolume
                     && let Some(l) = normalize_drive_letter(&resource.target)
@@ -485,10 +485,35 @@ pub fn classify(c: &Command) -> Class {
     }
 }
 
+/// Espaço da resposta do histórico, abaixo do limite do pipe (sobra para o envelope).
+pub const HISTORY_BUDGET: usize = bytehalt_ipc::MAX_MESSAGE - 2048;
+
+/// Mais recentes primeiro: mantém os eventos que cabem no limite de uma resposta do pipe e corta os
+/// mais antigos. Sem isso, um histórico válido com textos longos excedia o limite e a resposta
+/// inteira falhava.
+pub fn fit_history(entries: Vec<JournalEntry>) -> Vec<JournalEntry> {
+    let mut used = 2usize;
+    let mut out = Vec::with_capacity(entries.len());
+    for e in entries {
+        let size = serde_json::to_vec(&e).map(|v| v.len() + 1).unwrap_or(usize::MAX);
+        if used.saturating_add(size) > HISTORY_BUDGET {
+            break;
+        }
+        used += size;
+        out.push(e);
+    }
+    out
+}
+
 /// Regras de autorização (docs/ARCHITECTURE.md §6). `owner` é o SID que configurou primeiro.
 pub fn authorized(c: &Command, caller: &Caller, owner: Option<&str>, simulated: bool) -> bool {
     if caller.sid.is_empty() {
         return false;
+    }
+    // A ociosidade relatada move os temporizadores de todos os grupos: só quem controla a política
+    // (dono ou administrador) a informa. Não exige sessão da senha mestra (o envio é automático).
+    if let Command::ReportSessionIdle { .. } = c {
+        return caller.is_admin || owner.is_none_or(|o| o.eq_ignore_ascii_case(&caller.sid));
     }
     match classify(c) {
         Class::ReadOrProtect => true,

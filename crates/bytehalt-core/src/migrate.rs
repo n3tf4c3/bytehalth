@@ -70,6 +70,14 @@ pub fn scan(root: &Path) -> io::Result<Inventory> {
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
+            // Nomes que a cópia trata como metadados de volume seriam omitidos sem aviso.
+            if dir == root && is_volume_metadata(&entry.file_name().to_string_lossy()) {
+                inv.blocking.push(format!(
+                    "A pasta contém \"{}\" na raiz, nome reservado do Windows que não seria copiado. Renomeie ou mova antes de criar o cofre.",
+                    entry.file_name().to_string_lossy()
+                ));
+                continue;
+            }
             let m = match fs::symlink_metadata(&path) {
                 Ok(m) => m,
                 Err(e) => {
@@ -167,6 +175,16 @@ pub fn manifest(root: &Path, hash: bool) -> io::Result<Manifest> {
         }
     }
     Ok(out)
+}
+
+/// Algum item da raiz de `dir` tem nome reservado de metadados de volume.
+pub fn has_reserved_root_names(dir: &Path) -> io::Result<bool> {
+    for entry in fs::read_dir(dir)? {
+        if is_volume_metadata(&entry?.file_name().to_string_lossy()) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Pastas de sistema da raiz de um volume NTFS.
@@ -508,5 +526,17 @@ mod tests {
         let inv = scan(&src).unwrap();
         assert!(inv.blocking.iter().any(|b| b.contains("link")), "{:?}", inv.blocking);
         assert!(copy_item(&src.join("link"), &t.path().join("x"), &NoSecurity).is_err());
+    }
+
+    // Achado de auditoria #7: em pasta comum, nomes reservados de volume não podem sumir da cópia.
+    #[test]
+    fn nome_reservado_na_raiz_de_pasta_comum_impede_a_migracao() {
+        let t = tempfile::tempdir().unwrap();
+        let src = t.path().join("src");
+        tree(&src);
+        fs::create_dir_all(src.join("System Volume Information")).unwrap();
+        fs::write(src.join("System Volume Information").join("notas.txt"), b"dados do usuario").unwrap();
+        let inv = scan(&src).unwrap();
+        assert!(inv.blocking.iter().any(|b| b.contains("System Volume Information")), "pasta com nome reservado foi aceita: {:?}", inv.blocking);
     }
 }
